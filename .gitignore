@@ -1,0 +1,14 @@
+# Node / Frontend
+browser/node_modules/
+browser/dist/
+browser/.env*
+# Python / Backend
+server/.venv/
+server/__pycache__/
+server/*.pyc
+server/.env*
+# Docker
+*.log
+# OS / Editor
+.DS_Store
+.vscode/
