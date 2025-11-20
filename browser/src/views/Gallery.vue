@@ -221,7 +221,7 @@ onMounted(fetchTags)
       </main>
     </section>
     <!-- 上传弹窗：标签选项与左侧筛选一致 -->
-    <UploadDialogv-model="showUpload":tag-options="allTags" @uploaded="onUploaded"/>
+    <UploadDialog v-model="showUpload": tag-options="allTags" @uploaded="onUploaded"/>
 
   </div>
 </template>
