@@ -1,4 +1,9 @@
+
+
+
+
 <script setup>
+
 // ===== 页面逻辑：仅前端态，不依赖后端 =====
 import { ref, reactive, computed, watchEffect, onMounted } from 'vue'
 import UploadDialog from '../components/UploadDialog.vue'
@@ -6,9 +11,10 @@ import { ElMessage } from 'element-plus'
 import { Search, Upload } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 import api from '../api/http' // 预留：将来可从 /api/tags 获取真实标签
-
+//import api from '../api/http'
 const store = useAuthStore()
-
+const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '')
+const toAbs = (p) => (p?.startsWith('http') ? p : API + p)
 // —— 顶部控件 —— //
 const bulkMode = ref(false)
 
@@ -22,20 +28,42 @@ const filters = reactive({
 
 // —— 数据源（演示数据开关）—— //
 // 说明：现在用 DEMO 数据；上线后只要换成接口数据即可；标签会自动跟着数据变化
-const USE_DEMO = true
-const demoItems = [
-  { id: 1, title: '壮丽山景', tags: ['风景','自然'], date: '2024-11-05', sizeMB: 3.2, device: '相机', cover: 'https://picsum.photos/seed/land1/1280/720' },
-  { id: 2, title: '现代建筑', tags: ['建筑','城市'], date: '2024-11-04', sizeMB: 2.8, device: '相机', cover: 'https://picsum.photos/seed/build1/1280/720' },
-  { id: 3, title: '美味佳肴', tags: ['美食'],      date: '2024-11-03', sizeMB: 1.9, device: '手机', cover: 'https://picsum.photos/seed/food1/1280/720' },
-  { id: 4, title: '抽象艺术', tags: ['艺术'],      date: '2024-11-02', sizeMB: 4.1, device: '平板', cover: 'https://picsum.photos/seed/art1/1280/720' },
-  { id: 5, title: '野生动物', tags: ['动物','自然'], date: '2024-10-31', sizeMB: 3.7, device: '相机', cover: 'https://picsum.photos/seed/animal1/1280/720' },
-  { id: 6, title: '城市夜景', tags: ['建筑','科技'], date: '2024-10-29', sizeMB: 3.5, device: '手机', cover: 'https://picsum.photos/seed/city1/1280/720' },
-]
-const items = ref(USE_DEMO ? demoItems : [])   // ← 以后换成接口返回即可：items.value = (await api.get('/api/images')).data
+//const USE_DEMO = true
+//const demoItems = [
+//  { id: 1, title: '壮丽山景', tags: ['风景','自然'], date: '2024-11-05', sizeMB: 3.2, device: '相机', cover: 'https://picsum.photos/seed/land1/1280/720' },
+ // { id: 2, title: '现代建筑', tags: ['建筑','城市'], date: '2024-11-04', sizeMB: 2.8, device: '相机', cover: 'https://picsum.photos/seed/build1/1280/720' },
+//  { id: 3, title: '美味佳肴', tags: ['美食'],      date: '2024-11-03', sizeMB: 1.9, device: '手机', cover: 'https://picsum.photos/seed/food1/1280/720' },
+//  { id: 4, title: '抽象艺术', tags: ['艺术'],      date: '2024-11-02', sizeMB: 4.1, device: '平板', cover: 'https://picsum.photos/seed/art1/1280/720' },
+ // { id: 5, title: '野生动物', tags: ['动物','自然'], date: '2024-10-31', sizeMB: 3.7, device: '相机', cover: 'https://picsum.photos/seed/animal1/1280/720' },
+ // { id: 6, title: '城市夜景', tags: ['建筑','科技'], date: '2024-10-29', sizeMB: 3.5, device: '手机', cover: 'https://picsum.photos/seed/city1/1280/720' },
+//]
+//const items = ref(USE_DEMO ? demoItems : [])   // ← 以后换成接口返回即可：items.value = (await api.get('/api/images')).data
 
 // —— 关键点：标签是“动态”的 —— //
 // 1) 默认：从 items 自动聚合得出所有标签（去重、排序）
 // 2) 将来接后端时：把 ENABLE_REMOTE_TAGS=true，并实现 fetchTags() 从 /api/tags 拉取
+
+const USE_DEMO = false
+const items = ref([])
+
+const loadImages = async () => {
+  try {
+    const { data } = await api.get('/api/images')
+    items.value = (data.items || []).map(it => ({
+      id: it.id,
+      title: it.title,
+      tags: it.tags,
+      date: it.date,
+      sizeMB: it.sizeMB,
+      device: '',
+      cover: toAbs(it.url),
+    }))
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || 'Load images failed')
+  }
+}
+onMounted(loadImages)
+
 const ENABLE_REMOTE_TAGS = false
 const allTags = ref([])
 async function fetchTags() {
@@ -100,9 +128,9 @@ const resetFilters = () => {
 
 const showUpload = ref(false)
 const onUploadClick = () => (showUpload.value = true)
-
+const onUploaded = async () => { await loadImages() }
 // 接收上传成功事件：演示模式下把新图片临时插入到最前（刷新后会消失，等接后端就改为拉取接口）
-const onUploaded = (payload) => {
+/*const onUploaded = (payload) => {
   if (!payload?.files?.length) return
   if (USE_DEMO) {
     const today = new Date().toISOString().slice(0, 10)
@@ -119,8 +147,12 @@ const onUploaded = (payload) => {
   }
   showUpload.value = false
 }
-onMounted(fetchTags)
+onMounted(fetchTags)*/
+
+
 </script>
+
+
 
 <template>
   <div class="page">
@@ -221,7 +253,7 @@ onMounted(fetchTags)
       </main>
     </section>
     <!-- 上传弹窗：标签选项与左侧筛选一致 -->
-    <UploadDialog v-model="showUpload": tag-options="allTags" @uploaded="onUploaded"/>
+    <UploadDialog v-model="showUpload" :tag-options="allTags" @uploaded="onUploaded"/>
 
   </div>
 </template>

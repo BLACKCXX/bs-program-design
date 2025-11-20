@@ -41,7 +41,7 @@ function reset() {
 
 const uploading = ref(false)
 // ⚠️ 现在用模拟上传；接入后端时把 USE_MOCK=false，并放开 api.post('/api/upload', ...)
-const USE_MOCK = true
+const USE_MOCK = false
 
 async function submit() {
   if (!fileList.value.length) return
