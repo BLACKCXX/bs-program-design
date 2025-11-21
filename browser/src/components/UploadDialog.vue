@@ -122,7 +122,17 @@ function onCancel() {
           <el-input v-model="form.description" type="textarea" :rows="3" placeholder="添加描述信息..." />
         </el-form-item>
         <el-form-item label="标签（可选）">
-          <el-select v-model="form.tags" multiple filterable collapse-tags placeholder="选择标签" style="width:100%;">
+          <!-- #advise 允许从下拉选择或直接输入自定义标签 -->
+          <el-select
+            v-model="form.tags"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            collapse-tags
+            placeholder="选择或输入标签"
+            style="width:100%;"
+          >
             <el-option v-for="t in allTags" :key="t" :label="t" :value="t" />
           </el-select>
         </el-form-item>

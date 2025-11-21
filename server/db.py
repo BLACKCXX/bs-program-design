@@ -6,6 +6,7 @@
 import os
 import pymysql
 from contextlib import contextmanager
+import os, pymysql
 
 def _cfg():
     return dict(
@@ -35,3 +36,31 @@ def dict_cursor():
         raise
     finally:
         conn.close()
+
+def get_conn():
+    return pymysql.connect(
+        host=os.getenv("DB_HOST","127.0.0.1"),
+        user=os.getenv("DB_USER","root"),
+        password=os.getenv("DB_PASSWORD",""),
+        database=os.getenv("DB_NAME","bs"),
+        charset="utf8mb4",
+        autocommit=True,
+        cursorclass=pymysql.cursors.DictCursor
+    )
+
+def query(sql, args=None, many=False):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql, args or ())
+        return cur.fetchall()
+
+def execute(sql, args=None):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.execute(sql, args or ())
+        return cur.lastrowid
+
+def executemany(sql, rows):
+    conn = get_conn()
+    with conn.cursor() as cur:
+        cur.executemany(sql, rows)

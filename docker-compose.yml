@@ -16,10 +16,13 @@ services:
     volumes:
       - dbdata:/var/lib/mysql
       - ./database/schema.sql:/docker-entrypoint-initdb.d/10_schema.sql:ro
+      - ./server:/app
+      - uploads_data:/app/uploads 
     healthcheck:
       test: ["CMD","mysqladmin","ping","-h","localhost","-prootpass"]
       interval: 5s
       timeout: 3s
       retries: 40
 volumes:
+  uploads_data:
   dbdata:

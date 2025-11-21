@@ -1,0 +1,59 @@
+Goal: Help ChatGPT continue this project by wiring real backend data so clicking an image opens its true detail page (no more mock). Below is the project context (structure/flows) and what functions still need to be written. Upload these files for ChatGPT to work.
+
+Project structure (key parts)
+- browser/src/api/http.js (Axios with JWT header)
+- browser/src/router/index.js (routes: gallery, auth, ImageDetail)
+- browser/src/views/Gallery.vue (lists images from /api/images; clicking card goes to /images/:id)
+- browser/src/views/ImageDetail.vue (current mock detail page; needs real data)
+- browser/src/components/UploadDialog.vue (uploads to /api/upload)
+- browser/src/stores/auth.js (login/register store)
+- server/app.py (Flask app factory, JWT, registers images blueprint)
+- server/routes_images.py (upload/list, static files; to extend with detail API)
+- server/db.py (query/execute helpers using PyMySQL)
+- server/util_exif.py (extract EXIF)
+- database/schema.sql (tables users, images, tags, image_tags; fields include path, stored_path, exif fields)
+- docker-compose.yml (MySQL service and init SQL)
+
+Current behavior
+- Frontend Gallery.vue calls GET /api/images to show cards.
+- Detail page ImageDetail.vue is mock-only; loads local mockImages by id, not backend.
+- Upload hits POST /api/upload; server saves files to uploads/, writes images table.
+
+What functions/APIs need to be added (backend)
+1) GET /api/images/<id> (auth required)
+   - Return one image’s fields: id, title, description, visibility (if present), stored_path/path, mime_type, size_bytes, width, height, created_at, taken_at, camera_make/model, gps_lat/gps_lng, tags array (join tags), parent_id, children (if any derived).
+   - Build url: f"/files/{stored_path or path}".
+   - If not found or not owner: 404.
+
+2) Optional: PATCH /api/images/<id>
+   - Update title, description, visibility.
+   - Validate ownership.
+
+3) Ensure /api/images list already returns url; keep consistent with detail.
+
+4) If schema uses both path and stored_path, set both when inserting to avoid NOT NULL issues (already patched).
+
+Frontend tasks to hook real data
+- In ImageDetail.vue: fetch on mounted by id (from route), call /api/images/:id, populate state instead of mockImages; handle loading/error.
+- Use real tags array from API; keep local add/remove as TODO for future POST/DELETE.
+- Use image.url to render preview; time/EXIF fields from API.
+- Optional: clicking related child/parent images routes to their id.
+
+Files to upload for ChatGPT
+- server/app.py
+- server/routes_images.py
+- server/db.py
+- server/util_exif.py (if needed for EXIF fields)
+- database/schema.sql (and any migrations touching images/tags)
+- browser/src/api/http.js
+- browser/src/router/index.js
+- browser/src/views/Gallery.vue
+- browser/src/views/ImageDetail.vue
+- browser/src/components/UploadDialog.vue
+- browser/src/stores/auth.js
+- .env examples if needed (API base, DB creds)
+
+Known issues / notes
+- images table requires path non-null; insert should set both path and stored_path.
+- JWT auth via Authorization: Bearer <token>.
+- Static files served at /files/<path> using UPLOAD_DIR.

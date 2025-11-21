@@ -118,6 +118,8 @@ const onLogout = () => {
   store.logout()
   router.replace('/auth')
 }
+// 新增：点击卡片跳转到详情页（先走本地路由，后续可接真实数据）
+const goDetail = (id) => router.push({ name: 'ImageDetail', params: { id } })
 
 const resetFilters = () => {
   filters.tags = []
@@ -236,7 +238,8 @@ onMounted(fetchTags)*/
           <el-empty description="暂无图片，试试右上角“上传图片”" />
         </div>
         <div v-else class="grid">
-          <div v-for="it in displayItems" :key="it.id" class="card">
+          <!-- 新增：卡片可点击跳转详情页 -->
+          <div v-for="it in displayItems" :key="it.id" class="card" @click="goDetail(it.id)">
             <div class="cover" :style="it.cover ? { backgroundImage: `url(${it.cover})` } : {}"></div>
             <div class="card-body">
               <h4 class="title">{{ it.title || '未命名' }}</h4>
@@ -302,7 +305,7 @@ onMounted(fetchTags)*/
 @media (max-width: 720px)  { .content { grid-template-columns: 1fr; } .aside { position:static; height:auto; } .grid { grid-template-columns: 1fr; } }
 
 .card { background:#fff; border:1px solid #eef0f3; border-radius: 14px; overflow:hidden;
-  transition: transform .15s ease, box-shadow .15s ease; }
+  transition: transform .15s ease, box-shadow .15s ease; cursor: pointer; /* 新增：提示卡片可点击进入详情 */ }
 .card:hover { transform: translateY(-2px); box-shadow: 0 10px 22px rgba(27, 49, 88, 0.12); }
 .cover { width:100%; aspect-ratio: 16/9; background: linear-gradient(135deg,#f0f4ff,#ecfeff);
   background-size: cover; background-position: center; }
