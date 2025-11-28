@@ -1,19 +1,19 @@
-<script setup>
-// 新增详情页：直接使用后端数据渲染（不再用示例图）
+  <script setup>
+// 页面职责：加载 /api/images/:id 的详情并承载编辑弹层，前端暂存裁剪/调节参数，导出时统一提交
 import { ref, computed, onMounted } from 'vue'
-import api from '../api/http' //advise 调用后端接口
+import api from '../api/http'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, Crop, RefreshLeft, MagicStick, Download, Share, Delete as DeleteIcon, ZoomOut, ZoomIn, FullScreen } from '@element-plus/icons-vue'
+import { ArrowLeft, Download, Share, Delete as DeleteIcon, ZoomOut, ZoomIn, FullScreen, MagicStick } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
 
-//advise 统一拼接后端域名，避免 /files 路径丢失 HOST
+// API 基础地址与图片 URL 补全
 const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '')
 const toAbs = (p) => (p?.startsWith('http') ? p : (p ? API + p : ''))
 
-//advise 默认空对象，接口返回后填充
+// 图片详情的初始结构，避免响应式缺字段
 const emptyImage = {
   id: null,
   title: '',
@@ -30,51 +30,45 @@ const emptyImage = {
   exif: {},
   relations: { parent: null, children: [] },
 }
-
-//advise 详情数据响应式存储
 const image = ref({ ...emptyImage })
 
-const activeTab = ref('basic') // 新增：Tabs 当前激活项
-const zoom = ref(100) // 新增：预览缩放比例，百分比
-const showGps = ref(false) // 新增：GPS 显示切换
-const newTag = ref('') // 新增：新增标签输入框
-const tagTypes = ['success', 'warning', 'info', 'danger'] // 新增：轮换标签颜色，保证不同标签视觉区分
+// 右侧信息区和预览相关 UI 状态
+const activeTab = ref('basic')
+const zoom = ref(100)
+const showGps = ref(false)
+const newTag = ref('')
+const tagTypes = ['success', 'warning', 'info', 'danger']
 
 const visibilityOptions = [
   { label: '公开', value: 'public' },
   { label: '私密', value: 'private' },
 ]
 
+// 文件信息：尺寸与大小展示
 const fileInfo = computed(() => ({
   sizeText: image.value.sizeMB ? `${image.value.sizeMB} MB` : '未知',
   dimension: image.value.width && image.value.height ? `${image.value.width} × ${image.value.height}` : '未知',
 }))
 
-const onBack = () => router.back() // 新增：返回列表
+const onBack = () => router.back()
 const changeZoom = (delta) => {
-  // 新增：简单缩放逻辑，限制在 50%~200%
   zoom.value = Math.min(200, Math.max(50, zoom.value + delta))
 }
 const fitScreen = () => {
-  // 新增：适应屏幕重置
   zoom.value = 100
 }
+// 顶部动作按钮提示占位
 const onAction = (action) => {
-  // 新增：操作按钮占位，后续可接入后端处理
-  console.log(`TODO: 调用后端处理 ${action}`)
   ElMessage.info(`${action} 功能待接入后端`)
 }
 const onFieldChange = () => {
-  // 新增：表单编辑占位，后续调用保存接口
-  console.log('TODO: 调用后端保存元数据', image.value)
+  console.log('TODO: 保存元数据到后端', image.value)
 }
 const removeTag = (tag) => {
-  // 新增：本地移除标签
   image.value.tags = image.value.tags.filter((t) => t !== tag)
   console.log('TODO: 调用后端删除标签', tag)
 }
 const addTag = () => {
-  // 新增：本地添加标签
   const name = (newTag.value || '').trim()
   if (!name) return
   if (!image.value.tags.includes(name)) {
@@ -84,36 +78,425 @@ const addTag = () => {
   newTag.value = ''
 }
 const toggleGps = () => {
-  // 新增：切换 GPS 显示
   showGps.value = !showGps.value
 }
 
-//advise 拉取后端详情数据，替换示例图
+const imgNatural = ref({ w: 0, h: 0 })
+const imgBox = ref({ w: 0, h: 0 })
+const imgEl = ref(null)
+// 图片加载时记录原始尺寸与展示尺寸，后续裁剪换算使用
+const onImgLoad = (e) => {
+  const el = e.target
+  imgNatural.value = { w: el.naturalWidth, h: el.naturalHeight }
+  const rect = el.getBoundingClientRect()
+  imgBox.value = { w: rect.width, h: rect.height }
+  initCropRect()
+}
+
+// 加载图片详情，附带版本戳破缓存，填充关系与标签
 const loadDetail = async () => {
   try {
     const { data } = await api.get(`/api/images/${route.params.id}`)
+    const versionTag = Date.now()
+    const absUrl = data.url ? `${toAbs(data.url)}?v=${versionTag}` : ''
     image.value = {
       ...emptyImage,
       ...data,
-      url: toAbs(data.url),
+      url: absUrl,
       exif: data.exif || {},
       relations: {
-        parent: data.relations?.parent ? { ...data.relations.parent, thumb: toAbs(data.relations.parent.thumb) } : null,
-        children: (data.relations?.children || []).map((c) => ({ ...c, thumb: toAbs(c.thumb) })),
+        parent: data.relations?.parent
+          ? { ...data.relations.parent, thumb: data.relations.parent.thumb ? `${toAbs(data.relations.parent.thumb)}?v=${versionTag}` : '' }
+          : null,
+        children: (data.relations?.children || []).map((c) => ({
+          ...c,
+          thumb: c.thumb ? `${toAbs(c.thumb)}?v=${versionTag}` : '',
+        })),
       },
       tags: data.tags || [],
     }
+    exportName.value = image.value.title || ''
   } catch (err) {
     ElMessage.error(err?.response?.data?.error || '加载图片详情失败')
   }
 }
 
 onMounted(loadDetail)
+
+// 编辑弹层状态：控制弹窗开关、对比模式与历史快照
+const showEditor = ref(false)
+const isCompare = ref(false)
+const history = ref([])
+
+// 裁剪参数：模式开关、比例、当前裁剪框、已应用裁剪、拖拽中间态
+const isCropping = ref(false)
+const cropRatio = ref('free')
+const customCropW = ref(1)
+const customCropH = ref(1)
+const cropRect = ref({ x: 0, y: 0, width: 0, height: 0 })
+const pendingCrop = ref(null)
+const dragState = ref(null)
+
+// 旋转范围与滤镜调节初始值
+const ROTATE_MIN = -180
+const ROTATE_MAX = 180
+const rotate = ref(0)
+
+const brightness = ref(0)
+const contrast = ref(0)
+const saturation = ref(0)
+const warmth = ref(0)
+const sharpen = ref(0)
+
+// 目标尺寸与锁比例配置
+const lockRatio = ref(true)
+const targetWidth = ref(null)
+const targetHeight = ref(null)
+
+const initCropRect = () => {
+  if (!imgNatural.value.w || !imgNatural.value.h) return
+  const w = imgNatural.value.w * 0.6
+  const h = imgNatural.value.h * 0.6
+  const x = (imgNatural.value.w - w) / 2
+  const y = (imgNatural.value.h - h) / 2
+  cropRect.value = { x, y, width: w, height: h }
+}
+
+// 将当前编辑状态压入 history，用于撤销
+const captureSnapshot = () => {
+  history.value.push({
+    cropRatio: cropRatio.value,
+    customCropW: customCropW.value,
+    customCropH: customCropH.value,
+    rotate: rotate.value,
+    brightness: brightness.value,
+    contrast: contrast.value,
+    saturation: saturation.value,
+    warmth: warmth.value,
+    sharpen: sharpen.value,
+    pendingCrop: pendingCrop.value ? { ...pendingCrop.value } : null,
+    cropRect: cropRect.value ? { ...cropRect.value } : null,
+    lockRatio: lockRatio.value,
+    targetWidth: targetWidth.value,
+    targetHeight: targetHeight.value,
+  })
+}
+
+const undo = () => {
+  const prev = history.value.pop()
+  if (!prev) return
+  // 恢复上一次快照的参数并退出裁剪模式
+  cropRatio.value = prev.cropRatio
+  customCropW.value = prev.customCropW
+  customCropH.value = prev.customCropH
+  rotate.value = prev.rotate
+  brightness.value = prev.brightness
+  contrast.value = prev.contrast
+  saturation.value = prev.saturation
+  warmth.value = prev.warmth
+  sharpen.value = prev.sharpen
+  pendingCrop.value = prev.pendingCrop ? { ...prev.pendingCrop } : null
+  cropRect.value = prev.cropRect ? { ...prev.cropRect } : { ...cropRect.value }
+  lockRatio.value = prev.lockRatio
+  targetWidth.value = prev.targetWidth
+  targetHeight.value = prev.targetHeight
+  isCropping.value = false
+}
+
+const toggleCropMode = () => {
+  isCropping.value = !isCropping.value
+  if (isCropping.value) {
+    // 进入裁剪模式时优先展示已应用裁剪框
+    if (pendingCrop.value) {
+      cropRect.value = { ...pendingCrop.value }
+    } else {
+      initCropRect()
+    }
+  }
+}
+
+const cancelCrop = () => {
+  isCropping.value = false
+  if (pendingCrop.value) {
+    cropRect.value = { ...pendingCrop.value }
+  } else {
+    initCropRect()
+  }
+}
+
+const setCrop = (val) => {
+  captureSnapshot()
+  cropRatio.value = val
+}
+const setCustomCrop = () => {
+  if (customCropW.value > 0 && customCropH.value > 0) {
+    captureSnapshot()
+    cropRatio.value = `${customCropW.value}:${customCropH.value}`
+  }
+}
+
+const rotateStep = (delta) => {
+  captureSnapshot()
+  let next = rotate.value + delta
+  if (next > ROTATE_MAX) next -= 360
+  if (next < ROTATE_MIN) next += 360
+  rotate.value = next
+}
+const rotateSliderChange = (val) => {
+  captureSnapshot()
+  rotate.value = val
+}
+
+const resetAdjust = () => {
+  captureSnapshot()
+  brightness.value = 0
+  contrast.value = 0
+  saturation.value = 0
+  warmth.value = 0
+  sharpen.value = 0
+}
+
+// 尺寸调整：根据锁定比例自动推算宽高，导出时生效
+const applySize = () => {
+  if (lockRatio.value) {
+    const parts = cropRatio.value && cropRatio.value !== 'free' ? cropRatio.value.split(':') : [image.value.width || 1, image.value.height || 1]
+    const rw = Number(parts[0]) || 1
+    const rh = Number(parts[1]) || 1
+    if (targetWidth.value && !targetHeight.value) {
+      targetHeight.value = Math.round((targetWidth.value / rw) * rh)
+    } else if (!targetWidth.value && targetHeight.value) {
+      targetWidth.value = Math.round((targetHeight.value / rh) * rw)
+    }
+  }
+  ElMessage.info('尺寸参数已应用，导出时生效')
+}
+
+// 裁剪应用：前端保存 pendingCrop，导出时一起提交
+const cropLoading = ref(false)
+const applyCrop = () => {
+  if (!isCropping.value) {
+    ElMessage.warning('请先进入裁剪模式并调整裁剪框')
+    return
+  }
+  if (cropLoading.value) return
+  cropLoading.value = true
+  try {
+    captureSnapshot()
+    pendingCrop.value = { ...cropRect.value }
+    isCropping.value = false
+    ElMessage.success('已应用裁剪，导出时会一并提交')
+  } finally {
+    cropLoading.value = false
+  }
+}
+
+// 关闭编辑器时重置所有临时状态与调节参数
+const resetEditingState = () => {
+  pendingCrop.value = null
+  isCropping.value = false
+  cropRatio.value = 'free'
+  customCropW.value = 1
+  customCropH.value = 1
+  rotate.value = 0
+  brightness.value = 0
+  contrast.value = 0
+  saturation.value = 0
+  warmth.value = 0
+  sharpen.value = 0
+  targetWidth.value = null
+  targetHeight.value = null
+  lockRatio.value = true
+  history.value = []
+  isCompare.value = false
+  exportName.value = image.value.title || ''
+  initCropRect()
+}
+
+const closeEditor = () => {
+  resetEditingState()
+  showEditor.value = false
+}
+
+const exportMode = ref('override')
+const exportName = ref('')
+const onExport = async () => {
+  if (exportMode.value === 'new' && !exportName.value.trim()) {
+    ElMessage.warning('请先输入导出名称')
+    return
+  }
+  // 组装导出载荷：包含裁剪框、旋转、基础调节、目标尺寸
+  const ratioParts = cropRatio.value && cropRatio.value !== 'free' ? cropRatio.value.split(':') : []
+  const cropPayload = pendingCrop.value ? { ...pendingCrop.value } : (isCropping.value ? { ...cropRect.value } : null)
+  const payload = {
+    mode: exportMode.value,
+    exportName: exportName.value || image.value.title,
+    rotate: rotate.value,
+    crop_ratio: cropRatio.value,
+    brightness: brightness.value,
+    contrast: contrast.value,
+    saturation: saturation.value,
+    warmth: warmth.value,
+    sharpen: sharpen.value,
+    crop_rect: cropPayload,
+    target_width: targetWidth.value,
+    target_height: targetHeight.value,
+    keep_ratio: lockRatio.value,
+    ratio_width: ratioParts.length === 2 ? Number(ratioParts[0]) || null : null,
+    ratio_height: ratioParts.length === 2 ? Number(ratioParts[1]) || null : null,
+  }
+  try {
+    const { data } = await api.post(`/api/images/${image.value.id}/edit`, payload)
+    ElMessage.success('导出成功')
+    if (data?.mode === 'new' && data?.image_id) {
+      await router.replace({ name: 'ImageDetail', params: { id: data.image_id } })
+    } else {
+      await loadDetail()
+    }
+    closeEditor()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '导出失败')
+  }
+}
+
+const startDrag = (evt, mode) => {
+  if (!isCropping.value) return
+  const rect = imgEl.value?.getBoundingClientRect()
+  if (!rect) return
+  // 记录拖拽起点与当前裁剪框，后续换算到原图坐标
+  dragState.value = {
+    mode,
+    startX: evt.clientX,
+    startY: evt.clientY,
+    box: rect,
+    cropStart: { ...cropRect.value },
+  }
+  window.addEventListener('mousemove', onDrag)
+  window.addEventListener('mouseup', endDrag)
+}
+
+const onDrag = (evt) => {
+  const st = dragState.value
+  if (!st) return
+  const dx = evt.clientX - st.startX
+  const dy = evt.clientY - st.startY
+  const fx = imgNatural.value.w / st.box.width
+  const fy = imgNatural.value.h / st.box.height
+  let { x, y, width, height } = st.cropStart
+  const moveX = dx * fx
+  const moveY = dy * fy
+
+  const clamp = () => {
+    x = Math.max(0, Math.min(imgNatural.value.w - width, x))
+    y = Math.max(0, Math.min(imgNatural.value.h - height, y))
+    width = Math.max(10, Math.min(imgNatural.value.w - x, width))
+    height = Math.max(10, Math.min(imgNatural.value.h - y, height))
+  }
+
+  if (st.mode === 'move') {
+    x += moveX
+    y += moveY
+    clamp()
+  } else {
+    if (st.mode.includes('e')) {
+      width += moveX
+    }
+    if (st.mode.includes('w')) {
+      x += moveX
+      width -= moveX
+    }
+    if (st.mode.includes('s')) {
+      height += moveY
+    }
+    if (st.mode.includes('n')) {
+      y += moveY
+      height -= moveY
+    }
+    clamp()
+  }
+  cropRect.value = { x, y, width, height }
+}
+
+const endDrag = () => {
+  window.removeEventListener('mousemove', onDrag)
+  window.removeEventListener('mouseup', endDrag)
+  dragState.value = null
+}
+
+// 已应用的裁剪（退出裁剪模式后使用 pendingCrop 渲染预览）
+const appliedCrop = computed(() => (!isCropping.value ? pendingCrop.value : null))
+const editedStyle = computed(() => {
+  const filters = [
+    `brightness(${1 + brightness.value / 100})`,
+    `contrast(${1 + contrast.value / 100})`,
+    `saturate(${1 + saturation.value / 100})`,
+  ]
+  const style = {
+    filter: filters.join(' '),
+  }
+  const crop = appliedCrop.value
+  const { w, h } = imgNatural.value
+  if (crop && w && h && crop.width && crop.height) {
+    const scaleX = w / crop.width
+    const scaleY = h / crop.height
+    style.width = `${scaleX * 100}%`
+    style.height = `${scaleY * 100}%`
+    style.transformOrigin = 'top left'
+    const translateX = -(crop.x / crop.width) * 100
+    const translateY = -(crop.y / crop.height) * 100
+    style.transform = `translate(${translateX}%, ${translateY}%) rotate(${rotate.value}deg)`
+  } else {
+    style.transform = `rotate(${rotate.value}deg)`
+  }
+  return style
+})
+
+const cropRectStyle = computed(() => {
+  if (!isCropping.value) return {}
+  const { w: dw, h: dh } = imgBox.value
+  const { w: nw, h: nh } = imgNatural.value
+  if (!dw || !dh || !nw || !nh) return {}
+  const fx = dw / nw
+  const fy = dh / nh
+  const { x, y, width, height } = cropRect.value
+  return {
+    left: `${x * fx}px`,
+    top: `${y * fy}px`,
+    width: `${width * fx}px`,
+    height: `${height * fy}px`,
+  }
+})
+
+const cropBoxStyle = computed(() => {
+  if (isCropping.value) {
+    const { w: dw, h: dh } = imgBox.value
+    const { w: nw, h: nh } = imgNatural.value
+    if (!dw || !dh || !nw || !nh) return {}
+    return { position: 'relative', alignItems: 'start', justifyItems: 'start' }
+  }
+  const applied = appliedCrop.value
+  if (applied && applied.width && applied.height) {
+    return {
+      aspectRatio: `${applied.width} / ${applied.height}`,
+      overflow: 'hidden',
+      position: 'relative',
+      alignItems: 'start',
+      justifyItems: 'start',
+    }
+  }
+  if (!cropRatio.value || cropRatio.value === 'free') return {}
+  const parts = cropRatio.value.split(':')
+  if (parts.length !== 2) return {}
+  const w = Number(parts[0]) || 1
+  const h = Number(parts[1]) || 1
+  return {
+    aspectRatio: `${w} / ${h}`,
+    overflow: 'hidden',
+  }
+})
 </script>
 
 <template>
   <div class="detail-page">
-    <!-- 顶部操作栏 -->
     <header class="detail-top">
       <div class="top-left">
         <el-button text class="back-btn" @click="onBack">
@@ -124,16 +507,14 @@ onMounted(loadDetail)
         <span class="title">{{ image.title }}</span>
       </div>
       <div class="top-actions">
-        <el-button text :icon="Crop" @click="onAction('裁剪')">裁剪</el-button>
-        <el-button text :icon="RefreshLeft" @click="onAction('旋转')">旋转</el-button>
-        <el-button text :icon="MagicStick" @click="onAction('滤镜')">滤镜</el-button>
+        <el-button text type="primary" :icon="MagicStick" @click="showEditor = true">图片编辑</el-button>
         <el-button text :icon="Download" @click="onAction('下载')">下载</el-button>
         <el-button text :icon="Share" @click="onAction('分享')">分享</el-button>
         <el-button text type="danger" :icon="DeleteIcon" @click="onAction('删除')">删除</el-button>
       </div>
     </header>
 
-    <!-- 主体：左侧预览 + 右侧信息 -->
+    <!-- 左侧预览区 + 右侧信息与标签 -->
     <section class="detail-layout">
       <div class="preview-column">
         <div class="panel preview-panel">
@@ -189,7 +570,6 @@ onMounted(loadDetail)
               <div class="block-title">图片标签</div>
               <el-button text type="primary" @click="addTag">+ 添加标签</el-button>
             </div>
-            <!-- 新增：标签按行展示并轮换颜色，避免同一行挤在一起 -->
             <div class="tag-list">
               <el-tag
                 v-for="(tag, idx) in image.tags"
@@ -217,7 +597,6 @@ onMounted(loadDetail)
             </div>
             <div class="block">
               <div class="block-title">拍摄参数</div>
-              <!-- 新增：EXIF 参数改为单列逐行展示，避免挤在同一行 -->
               <div class="info-column">
                 <div class="info-row"><span class="label">焦距</span><span class="value">{{ image.exif?.focal || '未知' }}</span></div>
                 <div class="info-row"><span class="label">光圈</span><span class="value">{{ image.exif?.aperture || '未知' }}</span></div>
@@ -249,9 +628,9 @@ onMounted(loadDetail)
           <el-tab-pane label="派生关系" name="relations">
             <div class="relations">
               <div class="relation-block">
-                <div class="block-title">父图片</div>
+                <div class="block-title">父图</div>
                 <div class="relation-card">
-                  <img :src="image.relations?.parent?.thumb" alt="" />
+                  <img :src="image.relations?.parent?.thumb || image.url" alt="" />
                   <div>
                     <div class="relation-title">{{ image.relations?.parent?.title || '原始图片' }}</div>
                     <div class="relation-tag">原始图片</div>
@@ -269,7 +648,7 @@ onMounted(loadDetail)
                 </div>
               </div>
               <div class="relation-block">
-                <div class="block-title">子图片 {{ image.relations?.children?.length ? `(${image.relations.children.length})` : '' }}</div>
+                <div class="block-title">子图 {{ image.relations?.children?.length ? `(${image.relations.children.length})` : '' }}</div>
                 <div class="relation-card child-card" v-for="child in image.relations?.children || []" :key="child.title">
                   <img :src="child.thumb" alt="" />
                   <div>
@@ -290,13 +669,162 @@ onMounted(loadDetail)
         </el-tabs>
       </div>
     </section>
+
+    <el-dialog v-model="showEditor" fullscreen :show-close="false" class="editor-dialog">
+      <div class="editor-header">
+        <div class="editor-title">图片编辑 - {{ image.title || '未命名' }}</div>
+        <el-button type="primary" @click="closeEditor">关闭</el-button>
+      </div>
+      <div class="editor-body">
+        <div class="editor-left">
+          <div class="editor-toolbar">
+            <div class="toolbar-actions">
+              <el-button size="small" :type="isCropping ? 'primary' : 'default'" @click="toggleCropMode">裁剪</el-button>
+              <el-button size="small" @click="isCompare = !isCompare" :disabled="isCropping">{{ isCompare ? '退出对比' : '双栏对比' }}</el-button>
+              <el-button size="small" @click="undo">撤销</el-button>
+            </div>
+          </div>
+
+          <div v-if="isCompare" class="compare-grid">
+            <div class="card neutral">
+              <div class="card-title">原图</div>
+              <div class="card-img" :style="cropBoxStyle">
+                <img :src="image.url" :alt="image.title" />
+              </div>
+            </div>
+            <div class="card neutral">
+              <div class="card-title">编辑后</div>
+              <div class="card-img" :style="cropBoxStyle" ref="imgEl">
+                <img :src="image.url" :alt="image.title" :style="editedStyle" @load="onImgLoad" />
+                <div class="crop-overlay" v-if="isCropping">
+                  <div class="crop-mask"></div>
+                  <div class="crop-rect" :style="cropRectStyle" @mousedown.prevent="startDrag($event, 'move')">
+                    <span class="handle handle-nw" @mousedown.stop.prevent="startDrag($event, 'nw')"></span>
+                    <span class="handle handle-ne" @mousedown.stop.prevent="startDrag($event, 'ne')"></span>
+                    <span class="handle handle-sw" @mousedown.stop.prevent="startDrag($event, 'sw')"></span>
+                    <span class="handle handle-se" @mousedown.stop.prevent="startDrag($event, 'se')"></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div v-else class="single-card neutral">
+            <div class="card-title">编辑后</div>
+            <div class="card-img" :style="cropBoxStyle" ref="imgEl">
+              <img :src="image.url" :alt="image.title" :style="editedStyle" @load="onImgLoad" />
+              <div class="crop-overlay" v-if="isCropping">
+                <div class="crop-mask"></div>
+                <div class="crop-rect" :style="cropRectStyle" @mousedown.prevent="startDrag($event, 'move')">
+                  <span class="handle handle-nw" @mousedown.stop.prevent="startDrag($event, 'nw')"></span>
+                  <span class="handle handle-ne" @mousedown.stop.prevent="startDrag($event, 'ne')"></span>
+                  <span class="handle handle-sw" @mousedown.stop.prevent="startDrag($event, 'sw')"></span>
+                  <span class="handle handle-se" @mousedown.stop.prevent="startDrag($event, 'se')"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="editor-right">
+          <div class="panel neutral">
+            <div class="panel-title">照片尺寸</div>
+            <div class="ratio-row">
+              <el-button-group>
+                <el-button :type="cropRatio === 'free' ? 'primary' : 'default'" @click="setCrop('free')">自由</el-button>
+                <el-button :type="cropRatio === '1:1' ? 'primary' : 'default'" @click="setCrop('1:1')">1:1</el-button>
+                <el-button :type="cropRatio === '4:3' ? 'primary' : 'default'" @click="setCrop('4:3')">4:3</el-button>
+                <el-button :type="cropRatio === '16:9' ? 'primary' : 'default'" @click="setCrop('16:9')">16:9</el-button>
+              </el-button-group>
+              <div class="custom-ratio">
+                <span class="custom-label">自定义：</span>
+                <el-input-number v-model="customCropW" size="small" :min="1" @change="setCustomCrop" controls-position="right" />
+                <span class="colon">:</span>
+                <el-input-number v-model="customCropH" size="small" :min="1" @change="setCustomCrop" controls-position="right" />
+              </div>
+            </div>
+            <div class="ratio-row">
+              <el-input-number v-model="targetWidth" :min="1" size="small" placeholder="宽(px)" />
+              <el-input-number v-model="targetHeight" :min="1" size="small" placeholder="高(px)" />
+              <el-checkbox v-model="lockRatio">锁定比例</el-checkbox>
+              <el-button size="small" type="primary" @click="applySize">应用尺寸</el-button>
+            </div>
+            <div class="ratio-row">
+              <el-button size="small" type="primary" @click="applyCrop" :disabled="!isCropping" :loading="cropLoading">应用裁剪</el-button>
+              <el-button size="small" @click="cancelCrop">取消裁剪</el-button>
+            </div>
+          </div>
+
+          <div class="panel neutral">
+            <div class="panel-title">旋转</div>
+            <div class="rotate-row">
+              <el-button size="small" @click="rotateStep(-90)">-90°</el-button>
+              <el-button size="small" @click="rotateStep(90)">+90°</el-button>
+              <span class="rotate-text">角度：{{ rotate }}°</span>
+            </div>
+            <div class="rotate-slider">
+              <el-slider v-model="rotate" :min="ROTATE_MIN" :max="ROTATE_MAX" :step="1" @change="rotateSliderChange" />
+            </div>
+          </div>
+
+          <div class="panel neutral">
+            <div class="panel-title">调节</div>
+            <div class="slider-row">
+              <span>亮度</span>
+              <el-slider v-model="brightness" :min="-100" :max="100" @change="captureSnapshot" />
+            </div>
+            <div class="slider-row">
+              <span>对比度</span>
+              <el-slider v-model="contrast" :min="-100" :max="100" @change="captureSnapshot" />
+            </div>
+            <div class="slider-row">
+              <span>饱和度</span>
+              <el-slider v-model="saturation" :min="-100" :max="100" @change="captureSnapshot" />
+            </div>
+            <div class="slider-row">
+              <span>色温</span>
+              <el-slider v-model="warmth" :min="-100" :max="100" @change="captureSnapshot" />
+            </div>
+            <div class="slider-row">
+              <span>锐化</span>
+              <el-slider v-model="sharpen" :min="0" :max="100" @change="captureSnapshot" />
+            </div>
+            <div class="slider-row reset-row">
+              <el-button size="small" @click="resetAdjust">重置所有调节</el-button>
+            </div>
+          </div>
+
+          <div class="panel neutral">
+            <div class="panel-title">导出 / 版本</div>
+            <div class="export-row">
+              <el-radio-group v-model="exportMode">
+                <el-radio label="override">覆盖原图</el-radio>
+                <el-radio label="new">导出为新图片</el-radio>
+              </el-radio-group>
+            </div>
+            <div class="export-name">
+              <span class="export-label">导出名称：</span>
+              <el-input v-model="exportName" placeholder="请输入导出图片名称" size="small" />
+              <div class="export-tip">
+                {{ exportMode === 'override' ? '覆盖时会以此名称更新原图标题' : '为新图片命名后再导出' }}
+              </div>
+            </div>
+            <div class="export-actions">
+              <el-button type="primary" @click="onExport">导出并保存</el-button>
+              <el-button @click="closeEditor">取消</el-button>
+            </div>
+            <div class="export-note">
+              <p>提示：未来可用“新建+删除原图”方式实现覆盖。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <style scoped>
-/* 新增：详情页整体布局与样式 */
 .detail-page {
-  background: #f6f8fb;
+  background: #f5f7fa;
   min-height: 100vh;
   padding-bottom: 24px;
 }
@@ -317,7 +845,7 @@ onMounted(loadDetail)
   gap: 8px;
 }
 .back-btn {
-  color: #374151;
+  color: #2c3e50;
 }
 .divider {
   color: #9ca3af;
@@ -343,7 +871,6 @@ onMounted(loadDetail)
   flex: 1.2;
   max-width: 420px;
   min-width: 320px;
-  /* 新增：适度收窄右侧栏，避免过宽占比 */
 }
 .panel {
   background: #fff;
@@ -360,7 +887,7 @@ onMounted(loadDetail)
 }
 .panel-title {
   font-weight: 600;
-  color: #374151;
+  color: #1f6feb;
 }
 .zoom-bar {
   display: flex;
@@ -373,7 +900,7 @@ onMounted(loadDetail)
   color: #374151;
 }
 .preview-body {
-  background: linear-gradient(135deg, #f3f4f6, #e5e7eb);
+  background: linear-gradient(135deg, #eef2f7, #e5e7eb);
   border-radius: 10px;
   padding: 16px;
   min-height: 520px;
@@ -404,7 +931,7 @@ onMounted(loadDetail)
 }
 .block-title {
   font-weight: 600;
-  color: #374151;
+  color: #1f6feb;
   margin-bottom: 8px;
 }
 .header-row {
@@ -421,7 +948,6 @@ onMounted(loadDetail)
 .tag-chip {
   display: inline-flex;
   width: fit-content;
-  /* 新增：标签单行展示 + 不同颜色 */
 }
 .tag-empty {
   color: #9ca3af;
@@ -446,10 +972,10 @@ onMounted(loadDetail)
   gap: 2px;
 }
 .gps-note {
-  background: #fef3c7;
-  color: #92400e;
+  background: #eef2f7;
+  color: #1f6feb;
   padding: 8px 12px;
-  border: 1px solid #fde68a;
+  border: 1px solid #d7e3f4;
   border-radius: 8px;
   margin-bottom: 8px;
   font-size: 13px;
@@ -460,7 +986,7 @@ onMounted(loadDetail)
 .map-placeholder {
   margin-top: 6px;
   padding: 12px;
-  background: #f3f4f6;
+  background: #f2f4f8;
   border-radius: 8px;
   color: #6b7280;
   border: 1px dashed #d1d5db;
@@ -500,11 +1026,11 @@ onMounted(loadDetail)
   color: #6b7280;
 }
 .relation-tag.primary {
-  color: #2563eb;
+  color: #1f6feb;
 }
 .current-card {
-  border: 1px solid #bfdbfe;
-  background: #eff6ff;
+  border: 1px solid #c7ddff;
+  background: #eef4ff;
 }
 .icon-box {
   width: 58px;
@@ -512,7 +1038,7 @@ onMounted(loadDetail)
   display: grid;
   place-items: center;
   border-radius: 10px;
-  background: #e0f2fe;
+  background: #e0ecff;
   font-size: 22px;
 }
 .child-card {
@@ -527,12 +1053,213 @@ onMounted(loadDetail)
   line-height: 1.6;
 }
 
+.editor-dialog :deep(.el-dialog__body) {
+  padding: 0;
+}
+.editor-dialog {
+  --neutral-bg: #f5f7fa;
+}
+.editor-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 18px;
+  background: var(--neutral-bg);
+  border-bottom: 1px solid #e5e7eb;
+}
+.editor-title {
+  font-weight: 700;
+  color: #1f6feb;
+}
+.editor-body {
+  display: flex;
+  gap: 16px;
+  padding: 16px;
+  background: var(--neutral-bg);
+  height: calc(100vh - 60px);
+  overflow: auto;
+}
+.editor-left {
+  flex: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.editor-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.editor-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+}
+.toolbar-actions {
+  display: flex;
+  gap: 8px;
+}
+.neutral {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+}
+.compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.single-card {
+  padding: 10px;
+}
+.card {
+  padding: 10px;
+}
+.card-title {
+  font-weight: 600;
+  color: #1f6feb;
+  margin-bottom: 8px;
+}
+.card-img {
+  position: relative;
+  background: #eef2f7;
+  border-radius: 10px;
+  padding: 8px;
+  display: grid;
+  place-items: center;
+  min-height: 260px;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+.card-img img {
+  width: 100%;
+  height: 100%;
+  border-radius: 10px;
+  object-fit: cover;
+}
+.crop-overlay {
+  position: absolute;
+  inset: 8px;
+  pointer-events: none;
+}
+.crop-rect {
+  position: absolute;
+  border: 2px solid #1f6feb;
+  border-radius: 4px;
+  box-sizing: border-box;
+  pointer-events: auto;
+}
+.crop-mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+.crop-rect .handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: #1f6feb;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  pointer-events: auto;
+}
+.handle-nw { top: -6px; left: -6px; cursor: nwse-resize; }
+.handle-ne { top: -6px; right: -6px; cursor: nesw-resize; }
+.handle-sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
+.handle-se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+.ratio-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.custom-ratio {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+.custom-label {
+  color: #4b5563;
+  font-size: 13px;
+}
+.colon {
+  color: #6b7280;
+}
+.rotate-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.rotate-text {
+  color: #1f6feb;
+}
+.rotate-slider {
+  margin-top: 8px;
+}
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+.slider-row span {
+  width: 60px;
+  color: #1f6feb;
+}
+.reset-row {
+  justify-content: flex-end;
+}
+.export-row {
+  margin-bottom: 10px;
+}
+.export-name {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.export-label {
+  color: #4b5563;
+  font-size: 13px;
+}
+.export-tip {
+  font-size: 12px;
+  color: #6b7280;
+}
+.export-actions {
+  display: flex;
+  gap: 10px;
+}
+.export-note {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #6b7280;
+}
+
 @media (max-width: 1100px) {
   .detail-layout {
     flex-direction: column;
   }
   .preview-body {
     min-height: 320px;
+  }
+  .editor-body {
+    flex-direction: column;
+  }
+  .compare-grid {
+    grid-template-columns: 1fr;
   }
 }
 </style>
