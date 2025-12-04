@@ -163,7 +163,7 @@ onMounted(fetchTags)*/
       <div class="left">
         <div class="logo">
           <div class="logo-icon"><span class="dot"></span><span class="tri"></span></div>
-          <span class="logo-text">Private Picture Shop</span>
+          <span class="logo-text">图片管理网站</span>
         </div>
         <el-input class="search" placeholder="搜索图片、标签…" :prefix-icon="Search" clearable />
       </div>

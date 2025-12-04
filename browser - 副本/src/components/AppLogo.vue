@@ -5,7 +5,7 @@
       <span class="dot"></span>
       <span class="mountain"></span>
     </div>
-    <div class="title">Private Picture Shop</div>
+    <div class="title">图片管理网站</div>
   </div>
 </template>
 
