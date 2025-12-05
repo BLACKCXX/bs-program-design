@@ -5,8 +5,9 @@ import os
 import time
 from datetime import datetime
 from io import BytesIO
+import zipfile  # #advise 批量打包下载
 
-from flask import Blueprint, current_app, g, jsonify, request, send_from_directory
+from flask import Blueprint, current_app, g, jsonify, request, send_file, send_from_directory
 from flask_jwt_extended import get_jwt_identity, jwt_required
 from PIL import Image, ImageEnhance, ImageOps  # 简单图像处理
 
@@ -341,6 +342,343 @@ def list_images():
         }
 
     return jsonify({"items": [fmt(r) for r in rows]})
+
+
+@bp.get("/api/images/search")
+@jwt_required()
+def search_images():
+    """高阶搜索：名称/描述模糊 + EXIF + 文件大小 + 多标签交集"""
+    g.user_id = _current_user_id_from_jwt()
+    args = request.args
+    limit = int(args.get("limit", 50))
+    offset = int(args.get("offset", 0))
+
+    q = (args.get("q") or "").strip()
+    date_start = (args.get("date_start") or "").strip()
+    date_end = (args.get("date_end") or "").strip()
+    fmt = (args.get("format") or "").strip().lower().lstrip(".")
+    camera_make = (args.get("camera_make") or "").strip()
+    camera_model = (args.get("camera_model") or "").strip()
+    iso = (args.get("iso") or "").strip()
+    focal_length = (args.get("focal_length") or "").strip()
+    min_size = (args.get("min_size_mb") or "").strip()
+    max_size = (args.get("max_size_mb") or "").strip()
+
+    tag_params = args.getlist("tags") or []
+    if not tag_params and args.get("tags"):
+        tag_params = [p.strip() for p in (args.get("tags") or "").split(",") if p.strip()]
+    tag_params = [t for t in tag_params if t]
+
+    conditions = ["i.owner_id=%s"]
+    params = [g.user_id]
+    joins = ["LEFT JOIN exif e ON e.image_id = i.id"]
+    having = ""
+    group_by = ""
+
+    # 名称 / 描述模糊
+    if q:
+        like = f"%{q}%"
+        conditions.append("(i.title LIKE %s OR i.description LIKE %s)")
+        params.extend([like, like])
+
+    # 时间范围（取拍摄时间/创建时间）
+    ts_expr = "COALESCE(i.taken_at, i.created_at)"
+    if date_start:
+        conditions.append(f"{ts_expr} >= %s")
+        params.append(date_start)
+    if date_end:
+        conditions.append(f"{ts_expr} <= %s")
+        params.append(date_end)
+
+    # 文件格式：扩展名或 mime
+    if fmt:
+        conditions.append(
+            "(LOWER(SUBSTRING_INDEX(i.stored_path,'.',-1))=%s "
+            "OR LOWER(SUBSTRING_INDEX(i.path,'.',-1))=%s "
+            "OR LOWER(SUBSTRING_INDEX(i.mime_type,'/',-1))=%s)"
+        )
+        params.extend([fmt, fmt, fmt])
+
+    # EXIF 维度
+    if camera_make:
+        conditions.append("COALESCE(e.camera_make, i.camera_make) LIKE %s")
+        params.append(f"%{camera_make}%")
+    if camera_model:
+        conditions.append("COALESCE(e.camera_model, i.camera_model) LIKE %s")
+        params.append(f"%{camera_model}%")
+    if iso:
+        try:
+            iso_val = int(iso)
+            conditions.append("e.iso = %s")
+            params.append(iso_val)
+        except Exception:
+            pass
+    if focal_length:
+        conditions.append("e.focal_length = %s")
+        params.append(focal_length)
+
+    # 文件大小（MB）
+    size_expr = "COALESCE(i.size_bytes, i.size) / 1024 / 1024.0"
+    try:
+        if min_size:
+            conditions.append(f"{size_expr} >= %s")
+            params.append(float(min_size))
+    except Exception:
+        pass
+    try:
+        if max_size:
+            conditions.append(f"{size_expr} <= %s")
+            params.append(float(max_size))
+    except Exception:
+        pass
+
+    # 标签交集过滤
+    if tag_params:
+        joins.append("JOIN image_tags it ON it.image_id = i.id")
+        joins.append("JOIN tags t ON t.id = it.tag_id")
+        conditions.append("t.owner_id=%s")
+        params.append(g.user_id)
+        placeholders = ",".join(["%s"] * len(tag_params))
+        conditions.append(f"t.name IN ({placeholders})")
+        params.extend(tag_params)
+        group_by = (
+            "GROUP BY i.id, i.title, i.description, i.stored_path, i.path, "
+            "i.size_bytes, i.size, i.taken_at, i.created_at, "
+            "i.camera_make, i.camera_model, e.camera_make, e.camera_model, e.iso, e.focal_length"
+        )
+        having = "HAVING COUNT(DISTINCT t.name) >= %s"
+        params.append(len(tag_params))
+
+    where_sql = " AND ".join(conditions)
+    sql = f"""
+        SELECT
+          i.id, i.title, i.description, i.stored_path, i.path,
+          COALESCE(i.size_bytes, i.size) AS size_bytes,
+          {ts_expr} AS sort_time,
+          i.taken_at, i.created_at,
+          COALESCE(e.camera_make, i.camera_make) AS camera_make,
+          COALESCE(e.camera_model, i.camera_model) AS camera_model,
+          e.iso, e.focal_length
+        FROM images i
+        {" ".join(joins)}
+        WHERE {where_sql}
+        {group_by}
+        {having}
+        ORDER BY sort_time DESC
+        LIMIT %s OFFSET %s
+    """
+    params.extend([limit, offset])
+
+    rows = query(sql, params)
+    if not rows:
+        return jsonify({"items": []})
+
+    ids = [r["id"] for r in rows]
+    tag_rows = query(
+        """
+        SELECT it.image_id, t.name
+        FROM image_tags it
+        JOIN tags t ON t.id = it.tag_id
+        WHERE it.image_id IN ({})
+        """.format(",".join(["%s"] * len(ids))),
+        ids,
+    )
+
+    tags_map = {}
+    for tr in tag_rows:
+        tags_map.setdefault(tr["image_id"], []).append(tr["name"])
+
+    def fmt_row(r):
+        rel_path = (r.get("stored_path") or r.get("path") or "").strip()
+        date_val = r.get("sort_time") or r.get("taken_at") or r.get("created_at")
+        taken = date_val.strftime("%Y-%m-%d") if date_val else None
+        size_mb = round((r.get("size_bytes") or 0) / 1024 / 1024, 1)
+        return {
+            "id": r["id"],
+            "title": r.get("title") or "未命名",
+            "description": r.get("description"),
+            "tags": tags_map.get(r["id"], []),
+            "date": taken,
+            "sizeMB": size_mb,
+            "url": f"/files/{rel_path}" if rel_path else "",
+        }
+
+    return jsonify({"items": [fmt_row(r) for r in rows]})
+
+
+# ===== #advise 热门标签（含标签名/图片标题模糊）=====
+@bp.get("/api/tags/popular")
+@jwt_required()
+def popular_tags():
+    g.user_id = _current_user_id_from_jwt()
+    kw = (request.args.get("q") or "").strip()
+    params = [g.user_id, g.user_id]
+    like_sql = ""
+    if kw:
+        like = f"%{kw}%"
+        like_sql = " AND (t.name LIKE %s OR i.title LIKE %s)"
+        params.extend([like, like])
+
+    sql = f"""
+        SELECT t.id, t.name, COUNT(DISTINCT it.image_id) AS image_count
+        FROM tags t
+        JOIN image_tags it ON it.tag_id = t.id
+        JOIN images i ON i.id = it.image_id
+        WHERE t.owner_id=%s AND i.owner_id=%s{like_sql}
+        GROUP BY t.id, t.name
+        ORDER BY image_count DESC, t.name ASC
+        LIMIT 50
+    """
+    rows = query(sql, params)
+    return jsonify([{"id": r["id"], "name": r["name"], "image_count": r["image_count"]} for r in rows])
+
+
+# ===== #advise 批量删除与批量加标签（仅操作数据，不改表结构）=====
+@bp.post("/api/images/batch/delete")
+@jwt_required()
+def batch_delete_images():
+    g.user_id = _current_user_id_from_jwt()
+    data = request.get_json(silent=True) or {}
+    ids = data.get("image_ids") or []
+    try:
+        ids = [int(x) for x in ids if str(x).isdigit()]
+    except Exception:
+        ids = []
+    if not ids:
+        return jsonify({"error": "缺少 image_ids"}), 400
+
+    placeholders = ",".join(["%s"] * len(ids))
+    valid_rows = query(
+        f"SELECT id FROM images WHERE owner_id=%s AND id IN ({placeholders})",
+        [g.user_id, *ids],
+    )
+    if not valid_rows:
+        return jsonify({"ok": True, "deleted": 0})
+
+    deleted = 0
+    for r in valid_rows:
+        execute("DELETE FROM images WHERE owner_id=%s AND id=%s", (g.user_id, r["id"]))
+        deleted += 1
+    return jsonify({"ok": True, "deleted": deleted})
+
+
+@bp.post("/api/images/batch/add_tags")
+@jwt_required()
+def batch_add_tags():
+    g.user_id = _current_user_id_from_jwt()
+    data = request.get_json(silent=True) or {}
+    ids = data.get("image_ids") or []
+    tags = data.get("tags") or []
+    try:
+        ids = [int(x) for x in ids if str(x).isdigit()]
+    except Exception:
+        ids = []
+    tags = [t.strip() for t in tags if t and str(t).strip()]
+    if not ids or not tags:
+        return jsonify({"error": "缺少 image_ids 或 tags"}), 400
+
+    placeholders = ",".join(["%s"] * len(ids))
+    valid_images = query(
+        f"SELECT id FROM images WHERE owner_id=%s AND id IN ({placeholders})",
+        [g.user_id, *ids],
+    )
+    if not valid_images:
+        return jsonify({"error": "没有可操作的图片"}), 400
+
+    # #advise 批量添加标签时，允许创建不存在的标签
+    tag_rows = []
+    for name in tags:
+        existing = query("SELECT id FROM tags WHERE owner_id=%s AND name=%s LIMIT 1", (g.user_id, name))
+        if existing:
+            tag_rows.append({"id": existing[0]["id"], "name": name})
+        else:
+            tid = execute("INSERT INTO tags (owner_id,name,kind) VALUES (%s,%s,%s)", (g.user_id, name, "user"))
+            tag_rows.append({"id": tid, "name": name})
+
+    pairs = []
+    for img in valid_images:
+        for t in tag_rows:
+            pairs.append((img["id"], t["id"]))
+    if pairs:
+        executemany("INSERT IGNORE INTO image_tags (image_id,tag_id) VALUES (%s,%s)", pairs)
+    return jsonify({"ok": True, "added": len(pairs)})
+
+
+# ===== #advise 单图删除与批量下载 =====
+@bp.delete("/api/images/<int:image_id>")
+@jwt_required()
+def delete_image(image_id: int):
+    g.user_id = _current_user_id_from_jwt()
+    rows = query("SELECT id, stored_path, path FROM images WHERE id=%s AND owner_id=%s LIMIT 1", (image_id, g.user_id))
+    if not rows:
+        return jsonify({"error": "图片不存在或无权限"}), 404
+    rel_path = (rows[0].get("stored_path") or rows[0].get("path") or "").strip()
+
+    execute("DELETE FROM images WHERE id=%s AND owner_id=%s", (image_id, g.user_id))
+
+    # 删除物理文件（存在则删除，不阻塞主流程）
+    if rel_path:
+        abs_root = os.path.abspath(current_app.config["UPLOAD_DIR"])
+        abs_path = os.path.join(abs_root, rel_path)
+        try:
+            if os.path.exists(abs_path):
+                os.remove(abs_path)
+        except Exception:
+            pass
+
+    return jsonify({"ok": True, "deleted": image_id})
+
+
+@bp.post("/api/images/batch/download")
+@jwt_required()
+def batch_download_images():
+    """批量下载：打包选中图片为 ZIP 返回"""
+    g.user_id = _current_user_id_from_jwt()
+    data = request.get_json(silent=True) or {}
+    ids = data.get("image_ids") or []
+    try:
+        ids = [int(x) for x in ids if str(x).isdigit()]
+    except Exception:
+        ids = []
+    if not ids:
+        return jsonify({"error": "缺少 image_ids"}), 400
+
+    placeholders = ",".join(["%s"] * len(ids))
+    rows = query(
+        f"""
+        SELECT id, title, stored_path, path
+        FROM images
+        WHERE owner_id=%s AND id IN ({placeholders})
+        """,
+        [g.user_id, *ids],
+    )
+    if not rows:
+        return jsonify({"error": "没有可下载的图片"}), 400
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        root = os.path.abspath(current_app.config["UPLOAD_DIR"])
+        for r in rows:
+            rel = (r.get("stored_path") or r.get("path") or "").strip()
+            if not rel:
+                continue
+            abs_path = os.path.join(root, rel)
+            if not os.path.exists(abs_path):
+                continue
+            base = os.path.basename(rel) or f"image_{r['id']}"
+            # 使用 id 前缀避免重名
+            arcname = f"{r['id']}_{base}"
+            try:
+                zf.write(abs_path, arcname=arcname)
+            except Exception:
+                continue
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name="private-picture-shop.zip",
+    )
 
 
 # 详细信息：基础信息/EXIF/标签/派生关系
@@ -711,5 +1049,13 @@ def edit_image(image_id: int):
 @jwt_required()
 def list_tags():
     g.user_id = _current_user_id_from_jwt()
-    rows = query("SELECT name FROM tags WHERE owner_id=%s ORDER BY name", (g.user_id,))
+    keyword = (request.args.get("q") or "").strip()
+    if keyword:
+        like = f"%{keyword}%"
+        rows = query(
+            "SELECT name FROM tags WHERE owner_id=%s AND name LIKE %s ORDER BY name LIMIT 50",
+            (g.user_id, like),
+        )
+    else:
+        rows = query("SELECT name FROM tags WHERE owner_id=%s ORDER BY name", (g.user_id,))
     return jsonify([r["name"] for r in rows])

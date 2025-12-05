@@ -5,10 +5,10 @@
 <script setup>
 
 // ===== 页面逻辑：仅前端态，不依赖后端 =====
-import { ref, reactive, computed, watchEffect, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch } from 'vue'
 import UploadDialog from '../components/UploadDialog.vue'
 import { ElMessage } from 'element-plus'
-import { Search, Upload } from '@element-plus/icons-vue'
+import { Search, Upload, Download, Delete, PriceTag } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 import api from '../api/http' // 预留：将来可从 /api/tags 获取真实标签
 //import api from '../api/http'
@@ -17,14 +17,19 @@ const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').repla
 const toAbs = (p) => (p?.startsWith('http') ? p : API + p)
 // —— 顶部控件 —— //
 const bulkMode = ref(false)
+const selectedIds = ref([]) // #advise 批量模式选中列表
 
 // —— 左侧筛选状态（仅本地过滤，不发后端） —— //
 const filters = reactive({
+  keyword: '',        // #advise 顶部搜索关键字
   tags: [],           // 选中的标签
   dateRange: [],      // [开始, 结束]
   sizeMB: [0, 100],   // 0~100 MB
   devices: [],        // 设备（占位：手机/相机/平板）
 })
+const tagKeyword = ref('')       // #advise 标签搜索关键字（标签+图片标题模糊）
+const popularTags = ref([])      // #advise 左侧显示的热门标签（仅前5）
+const uploadTagOptions = computed(() => popularTags.value.map((t) => t.name))
 
 // —— 数据源（演示数据开关）—— //
 // 说明：现在用 DEMO 数据；上线后只要换成接口数据即可；标签会自动跟着数据变化
@@ -45,11 +50,35 @@ const filters = reactive({
 
 const USE_DEMO = false
 const items = ref([])
+const loadingList = ref(false) // #advise 列表加载态
+const tagOptions = ref([])
+const tagLoading = ref(false)
+
+const formatDate = (val) => {
+  if (!val) return ''
+  const d = new Date(val)
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10)
+}
+
+const buildParams = () => {
+  const params = { limit: 200, offset: 0 }
+  const kw = (filters.keyword || '').trim()
+  if (kw) params.q = kw
+  if (filters.tags.length) params.tags = filters.tags
+  if (filters.dateRange?.length === 2) {
+    params.date_start = formatDate(filters.dateRange[0])
+    params.date_end = formatDate(filters.dateRange[1])
+  }
+  params.min_size_mb = Number(filters.sizeMB?.[0] ?? 0)
+  params.max_size_mb = Number(filters.sizeMB?.[1] ?? 100)
+  return params
+}
 
 const loadImages = async () => {
+  loadingList.value = true
   try {
-    const { data } = await api.get('/api/images')
-    items.value = (data.items || []).map(it => ({
+    const { data } = await api.get('/api/images/search', { params: buildParams() })
+    items.value = (data.items || []).map((it) => ({
       id: it.id,
       title: it.title,
       tags: it.tags,
@@ -57,57 +86,54 @@ const loadImages = async () => {
       sizeMB: it.sizeMB,
       device: '',
       cover: toAbs(it.url),
+      description: it.description,
     }))
   } catch (err) {
     ElMessage.error(err?.response?.data?.error || 'Load images failed')
+  } finally {
+    loadingList.value = false
   }
 }
-onMounted(loadImages)
 
-const ENABLE_REMOTE_TAGS = false
-const allTags = ref([])
-async function fetchTags() {
-  if (!ENABLE_REMOTE_TAGS) return
+const fetchPopularTags = async () => {
   try {
-    const { data } = await api.get('/api/tags') // 预期返回形如：['风景','人物',...]
-    allTags.value = Array.isArray(data) ? data : []
-  } catch {
-    // 后端未就绪时静默忽略，保持自动聚合策略
+    const { data } = await api.get('/api/tags/popular', { params: { q: tagKeyword.value || undefined } })
+    const sorted = (data || []).sort((a, b) => (b.image_count - a.image_count) || a.name.localeCompare(b.name, 'zh-Hans-CN'))
+    popularTags.value = sorted.slice(0, 5)
+  } catch (err) {
+    console.error(err)
   }
 }
 
-// 根据 items 自动推导标签（演示阶段）
-watchEffect(() => {
-  if (ENABLE_REMOTE_TAGS) return
-  const set = new Set()
-  for (const it of items.value) (it.tags || []).forEach(t => set.add(String(t)))
-  allTags.value = Array.from(set).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
-})
+const onTagSearchInput = () => {
+  clearTimeout(onTagSearchInput.timer)
+  onTagSearchInput.timer = setTimeout(fetchPopularTags, 300)
+}
 
-// 过滤后的展示列表（仅前端过滤）
+const loadTagOptions = async (kw = '') => {
+  tagLoading.value = true
+  try {
+    const { data } = await api.get('/api/tags', { params: { q: kw || undefined } })
+    const list = Array.isArray(data) ? data : []
+    const base = list.map((t) => ({ label: t, value: t }))
+    const trimmed = (kw || '').trim()
+    // #advise 批量添加标签时，允许创建不存在的标签
+    if (trimmed && !list.includes(trimmed)) {
+      base.unshift({ label: `创建新标签：${trimmed}`, value: trimmed, isNew: true })
+    }
+    tagOptions.value = base
+  } catch (err) {
+    console.error(err)
+  } finally {
+    tagLoading.value = false
+  }
+}
+
+// 过滤后的展示列表（仅本地后处理：设备筛选）
 const displayItems = computed(() => {
   let arr = [...items.value]
-  // 标签
-  if (filters.tags.length) {
-    arr = arr.filter(it => it.tags?.some(t => filters.tags.includes(t)))
-  }
-  // 时间
-  if (filters.dateRange?.length === 2) {
-    const [s, e] = filters.dateRange
-    const sd = new Date(s), ed = new Date(e)
-    arr = arr.filter(it => {
-      const d = new Date(it.date)
-      return !isNaN(+d) && d >= sd && d <= ed
-    })
-  }
-  // 大小
-  arr = arr.filter(it => {
-    const mb = Number(it.sizeMB || 0)
-    return mb >= filters.sizeMB[0] && mb <= filters.sizeMB[1]
-  })
-  // 设备（演示）
   if (filters.devices.length) {
-    arr = arr.filter(it => filters.devices.includes(it.device))
+    arr = arr.filter((it) => filters.devices.includes(it.device))
   }
   return arr
 })
@@ -121,11 +147,103 @@ const onLogout = () => {
 // 新增：点击卡片跳转到详情页（先走本地路由，后续可接真实数据）
 const goDetail = (id) => router.push({ name: 'ImageDetail', params: { id } })
 
+// #advise 批量模式：选中、工具条与退出
+const selectedCount = computed(() => selectedIds.value.length)
+const toggleSelect = (id) => {
+  const idx = selectedIds.value.indexOf(id)
+  if (idx >= 0) selectedIds.value.splice(idx, 1)
+  else selectedIds.value.push(id)
+}
+const onCardClick = (id) => {
+  if (bulkMode.value) {
+    toggleSelect(id)
+  } else {
+    goDetail(id)
+  }
+}
+watch(bulkMode, (val) => {
+  if (!val) selectedIds.value = []
+})
+
+const downloadSelected = async () => {
+  if (!selectedIds.value.length) return
+  try {
+    const { data } = await api.post(
+      '/api/images/batch/download',
+      { image_ids: selectedIds.value },
+      { responseType: 'blob' }
+    )
+    const url = window.URL.createObjectURL(new Blob([data]))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'private-picture-shop.zip'
+    a.click()
+    window.URL.revokeObjectURL(url)
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '批量下载失败')
+  }
+}
+
+const deleteSelected = async () => {
+  if (!selectedIds.value.length) return
+  try {
+    await api.post('/api/images/batch/delete', { image_ids: selectedIds.value })
+    ElMessage.success('已删除选中图片')
+    selectedIds.value = []
+    await loadImages()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '删除失败')
+  }
+}
+
+const showTagDialog = ref(false)
+const dialogTags = ref([])
+const openAddTagDialog = () => {
+  if (!selectedIds.value.length) {
+    ElMessage.warning('请先选择图片')
+    return
+  }
+  dialogTags.value = []
+  loadTagOptions()
+  showTagDialog.value = true
+}
+const confirmAddTags = async () => {
+  if (!dialogTags.value.length || !selectedIds.value.length) {
+    showTagDialog.value = false
+    return
+  }
+  try {
+    await api.post('/api/images/batch/add_tags', { image_ids: selectedIds.value, tags: dialogTags.value })
+    ElMessage.success('已添加标签')
+    showTagDialog.value = false
+    await loadImages()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '添加标签失败')
+  }
+}
+
+let filterTimer
+watch(
+  () => ({ ...filters, tags: [...filters.tags], dateRange: [...filters.dateRange], sizeMB: [...filters.sizeMB] }),
+  () => {
+    clearTimeout(filterTimer)
+    filterTimer = setTimeout(loadImages, 400)
+  },
+  { deep: true }
+)
+
+onMounted(() => {
+  fetchPopularTags()
+  loadImages()
+})
+
 const resetFilters = () => {
+  filters.keyword = ''
   filters.tags = []
   filters.dateRange = []
   filters.sizeMB = [0, 100]
   filters.devices = []
+  loadImages()
 }
 
 const showUpload = ref(false)
@@ -162,10 +280,20 @@ onMounted(fetchTags)*/
     <header class="nav">
       <div class="left">
         <div class="logo">
-          <div class="logo-icon"><span class="dot"></span><span class="tri"></span></div>
-          <span class="logo-text">Private Picture Shop</span>
+          <div class="logo-badge">P</div>
+          <div class="logo-text">
+            <div class="logo-title">Private Picture Shop</div>
+            <div class="logo-sub">Your Private Image Manager</div>
+          </div>
         </div>
-        <el-input class="search" placeholder="搜索图片、标签…" :prefix-icon="Search" clearable />
+        <el-input
+          v-model="filters.keyword"
+          class="search"
+          placeholder="搜索图片、描述或标签…"
+          :prefix-icon="Search"
+          clearable
+          @keyup.enter="loadImages"
+        />
       </div>
       <div class="right">
         <div class="bulk"><span>批量模式</span><el-switch v-model="bulkMode" /></div>
@@ -185,6 +313,16 @@ onMounted(fetchTags)*/
       </div>
     </header>
 
+    <div v-if="bulkMode" class="bulk-bar card">
+      <div class="bulk-info">已选择 {{ selectedCount }} 张图片</div>
+      <div class="bulk-actions">
+        <el-button :icon="Download" :disabled="!selectedCount" @click="downloadSelected">下载</el-button>
+        <el-button type="danger" :icon="Delete" :disabled="!selectedCount" @click="deleteSelected">删除</el-button>
+        <el-button type="primary" :icon="PriceTag" :disabled="!selectedCount" @click="openAddTagDialog">添加标签</el-button>
+      </div>
+      <el-button class="exit-bulk" @click="bulkMode = false">退出批量</el-button>
+    </div>
+
     <!-- 主体：左侧筛选 + 右侧网格 -->
     <section class="content">
       <!-- 左侧筛选 -->
@@ -196,12 +334,22 @@ onMounted(fetchTags)*/
 
         <div class="block">
           <div class="block-title">标签</div>
+          <el-input
+            v-model="tagKeyword"
+            size="small"
+            placeholder="搜索标签/标题"
+            clearable
+            @input="onTagSearchInput"
+          />
           <el-checkbox-group v-model="filters.tags" class="v-list">
-            <template v-if="allTags.length">
-              <el-checkbox v-for="t in allTags" :key="t" :label="t" />
+            <template v-if="popularTags.length">
+              <el-checkbox v-for="t in popularTags" :key="t.id" :label="t.name">
+                <span class="tag-name">{{ t.name }}</span>
+                <span class="tag-count">{{ t.image_count }}</span>
+              </el-checkbox>
             </template>
             <template v-else>
-              <div class="empty-help">暂无标签（无数据或未加载）</div>
+              <div class="empty-help">暂无热门标签</div>
             </template>
           </el-checkbox-group>
         </div>
@@ -234,12 +382,24 @@ onMounted(fetchTags)*/
 
       <!-- 右侧卡片网格 -->
       <main class="main">
-        <div v-if="!displayItems.length" class="empty">
+        <div v-if="loadingList" class="empty">
+          <el-empty description="加载中..." />
+        </div>
+        <div v-else-if="!displayItems.length" class="empty">
           <el-empty description="暂无图片，试试右上角“上传图片”" />
         </div>
         <div v-else class="grid">
           <!-- 新增：卡片可点击跳转详情页 -->
-          <div v-for="it in displayItems" :key="it.id" class="card" @click="goDetail(it.id)">
+          <div
+            v-for="it in displayItems"
+            :key="it.id"
+            class="card"
+            :class="{ 'is-selectable': bulkMode, 'is-selected': selectedIds.includes(it.id) }"
+            @click="onCardClick(it.id)"
+          >
+            <div v-if="bulkMode" class="card-checkbox">
+              <el-checkbox :model-value="selectedIds.includes(it.id)" @change.stop="toggleSelect(it.id)" />
+            </div>
             <div class="cover" :style="it.cover ? { backgroundImage: `url(${it.cover})` } : {}"></div>
             <div class="card-body">
               <h4 class="title">{{ it.title || '未命名' }}</h4>
@@ -255,8 +415,28 @@ onMounted(fetchTags)*/
         </div>
       </main>
     </section>
+    <el-dialog v-model="showTagDialog" title="为选中图片添加标签" width="420px">
+      <el-select
+        v-model="dialogTags"
+        multiple
+        filterable
+        remote
+        :remote-method="loadTagOptions"
+        :loading="tagLoading"
+        allow-create
+        default-first-option
+        placeholder="选择或创建标签"
+        style="width: 100%;"
+      >
+        <el-option v-for="opt in tagOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+      </el-select>
+      <template #footer>
+        <el-button @click="showTagDialog = false">取消</el-button>
+        <el-button type="primary" @click="confirmAddTags">确定</el-button>
+      </template>
+    </el-dialog>
     <!-- 上传弹窗：标签选项与左侧筛选一致 -->
-    <UploadDialog v-model="showUpload" :tag-options="allTags" @uploaded="onUploaded"/>
+    <UploadDialog v-model="showUpload" :tag-options="uploadTagOptions" @uploaded="onUploaded"/>
 
   </div>
 </template>
@@ -272,16 +452,21 @@ onMounted(fetchTags)*/
   height: 64px; padding: 0 18px; background: #fff; border-bottom: 1px solid #eef0f3;
 }
 .nav .left { display: flex; align-items: center; gap: 16px; flex: 1; min-width: 0; }
-.logo { display: flex; align-items: center; gap: 10px; min-width: 180px; }
-.logo-icon { width: 34px; height: 34px; border-radius: 10px; background: #eaf2ff; position: relative;
-  display:grid; place-items:center; box-shadow: inset 0 6px 16px rgba(59,130,246,.12); }
-.logo-icon .dot { width: 6px; height: 6px; background:#2563eb; border-radius:50%; position:absolute; left:8px; top:8px; }
-.logo-icon .tri { width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-bottom:14px solid #2563eb; }
-.logo-text { font-weight: 700; color:#28303f; white-space: nowrap; }
+.logo { display: flex; align-items: center; gap: 10px; min-width: 220px; }
+.logo-badge { width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center;
+  background: linear-gradient(135deg, #e0ecff, #c7dbff); color: #1d4ed8; font-weight: 800; box-shadow: 0 6px 18px rgba(59,130,246,.18); }
+.logo-text { display: flex; flex-direction: column; }
+.logo-title { font-weight: 800; color:#1f2937; line-height: 1.2; }
+.logo-sub { font-size: 12px; color:#6b7280; }
 .search { max-width: 560px; width: 100%; }
 .nav .right { display:flex; align-items:center; gap: 14px; }
 .bulk { display:flex; align-items:center; gap: 8px; color:#4b5563; font-size: 14px; }
 .avatar { cursor: pointer; }
+
+.bulk-bar { display: flex; align-items: center; gap: 14px; margin: 8px 18px 0; }
+.bulk-info { font-weight: 700; color: #1f2937; }
+.bulk-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.exit-bulk { margin-left: auto; }
 
 /* 主体两栏 */
 .content { display: grid; grid-template-columns: 260px 1fr; gap: 16px; padding: 16px; }
@@ -295,6 +480,8 @@ onMounted(fetchTags)*/
 .block { margin-top: 14px; }
 .block-title { font-weight: 600; margin-bottom: 8px; color:#374151; }
 .v-list :deep(.el-checkbox) { display:block; margin: 6px 0; }
+.tag-name { margin-right: 6px; }
+.tag-count { color: #6b7280; font-size: 12px; }
 .empty-help { font-size: 13px; color:#9aa0a6; }
 
 /* 右侧网格与卡片 */
@@ -304,14 +491,17 @@ onMounted(fetchTags)*/
 @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 720px)  { .content { grid-template-columns: 1fr; } .aside { position:static; height:auto; } .grid { grid-template-columns: 1fr; } }
 
-.card { background:#fff; border:1px solid #eef0f3; border-radius: 14px; overflow:hidden;
+.card { position: relative; background:#fff; border:1px solid #eef0f3; border-radius: 14px; overflow:hidden;
   transition: transform .15s ease, box-shadow .15s ease; cursor: pointer; /* 新增：提示卡片可点击进入详情 */ }
 .card:hover { transform: translateY(-2px); box-shadow: 0 10px 22px rgba(27, 49, 88, 0.12); }
+.card.is-selectable { border-color: #d6e4ff; }
+.card.is-selected { transform: translateY(2px); box-shadow: 0 12px 26px rgba(37, 99, 235, 0.2); border-color: #2563eb; }
 .cover { width:100%; aspect-ratio: 16/9; background: linear-gradient(135deg,#f0f4ff,#ecfeff);
   background-size: cover; background-position: center; }
 .card-body { padding: 12px 14px 14px; }
 .title { margin: 0 0 6px; font-size: 16px; color:#1f2937; }
 .tags { display:flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .meta { font-size: 13px; color:#9aa0a6; display:flex; gap:8px; align-items:center; }
+.card-checkbox { position: absolute; top: 10px; right: 10px; z-index: 2; background: rgba(255,255,255,0.8); border-radius: 8px; padding: 2px 4px; }
 .empty { margin-top: 8vh; }
 </style>

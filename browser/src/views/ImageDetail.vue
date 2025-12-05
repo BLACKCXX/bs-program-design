@@ -3,8 +3,8 @@
 import { ref, computed, onMounted } from 'vue'
 import api from '../api/http'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { ArrowLeft, Download, Share, Delete as DeleteIcon, ZoomOut, ZoomIn, FullScreen, MagicStick } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowLeft, Download, Delete as DeleteIcon, ZoomOut, ZoomIn, FullScreen, MagicStick } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -57,9 +57,33 @@ const changeZoom = (delta) => {
 const fitScreen = () => {
   zoom.value = 100
 }
-// 顶部动作按钮提示占位
-const onAction = (action) => {
-  ElMessage.info(`${action} 功能待接入后端`)
+// 顶部动作：下载与删除
+const onDownload = () => {
+  const raw = (image.value.url || '').split('?')[0]
+  if (!raw) {
+    ElMessage.warning('暂无可下载文件')
+    return
+  }
+  const a = document.createElement('a')
+  a.href = raw
+  a.download = image.value.title || `image_${image.value.id || ''}`
+  a.click()
+}
+
+const onDelete = async () => {
+  if (!image.value.id) return
+  try {
+    await ElMessageBox.confirm('删除后不可恢复，确认删除吗？', '确认删除', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await api.delete(`/api/images/${image.value.id}`)
+    ElMessage.success('删除成功')
+    router.replace({ name: 'gallery' })
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '删除失败')
+  }
 }
 const onFieldChange = () => {
   console.log('TODO: 保存元数据到后端', image.value)
@@ -508,9 +532,8 @@ const cropBoxStyle = computed(() => {
       </div>
       <div class="top-actions">
         <el-button text type="primary" :icon="MagicStick" @click="showEditor = true">图片编辑</el-button>
-        <el-button text :icon="Download" @click="onAction('下载')">下载</el-button>
-        <el-button text :icon="Share" @click="onAction('分享')">分享</el-button>
-        <el-button text type="danger" :icon="DeleteIcon" @click="onAction('删除')">删除</el-button>
+        <el-button text :icon="Download" @click="onDownload">下载</el-button>
+        <el-button text type="danger" :icon="DeleteIcon" @click="onDelete">删除</el-button>
       </div>
     </header>
 
