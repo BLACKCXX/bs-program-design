@@ -3,6 +3,7 @@ import { ref, reactive, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
 import api from '../api/http'
+import { useAiAnalyzer } from '../utils/useAiAnalyzer'
 
 const form = reactive({ title: '', description: '', tags: [] })
 const fileList = ref([])
@@ -30,6 +31,19 @@ function reset() {
   form.tags = []
   fileList.value = []
 }
+
+// 合并标签并去重，保持已有选择
+function mergeTags(newTags = []) {
+  const incoming = Array.isArray(newTags) ? newTags : [newTags].filter(Boolean)
+  const merged = new Set(form.tags || [])
+  incoming.forEach((t) => {
+    const name = (t || '').toString().trim()
+    if (name) merged.add(name)
+  })
+  form.tags = Array.from(merged)
+}
+
+const { analyzing, analyze: analyzeByAI } = useAiAnalyzer({ form, fileList, mergeTags })
 
 const submit = async () => {
   if (!fileList.value.length) {
@@ -117,6 +131,8 @@ const submit = async () => {
               allow-create
               default-first-option
               collapse-tags
+              :max-collapse-tags="4"
+              :reserve-keyword="false"
               placeholder="输入或选择标签"
             >
               <el-option v-for="t in tagOptions" :key="t" :label="t" :value="t" />
@@ -125,7 +141,16 @@ const submit = async () => {
         </el-form>
         <div class="actions">
           <el-button @click="reset">清空选择</el-button>
-          <el-button type="primary" :loading="uploading" :disabled="!fileList.length" @click="submit">
+          <el-button
+            type="primary"
+            plain
+            :disabled="!fileList.length || uploading || analyzing"
+            :loading="analyzing"
+            @click="analyzeByAI"
+          >
+            AI 智能分析
+          </el-button>
+          <el-button type="primary" :loading="uploading" :disabled="!fileList.length || analyzing" @click="submit">
             开始上传
           </el-button>
         </div>

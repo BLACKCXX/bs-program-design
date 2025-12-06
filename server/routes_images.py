@@ -6,12 +6,14 @@ import time
 from datetime import datetime
 from io import BytesIO
 import zipfile  # #advise 批量打包下载
+import tempfile
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file, send_from_directory
 from flask_jwt_extended import get_jwt_identity, jwt_required
 from PIL import Image, ImageEnhance, ImageOps  # 简单图像处理
 
 from server.db import execute, executemany, query
+from server.photo_analysis_agent import analyze_image
 from server.util_exif import extract_exif
 
 import jwt
@@ -27,6 +29,8 @@ ALLOWED_MIMES = {
     "image/heic",
     "image/heif",
 }
+TMP_AI_DIR = os.path.join(tempfile.gettempdir(), "bs_ai_tmp")
+os.makedirs(TMP_AI_DIR, exist_ok=True)
 
 # ===== 简易鉴权（沿用当前 JWT 配置）=====
 '''
@@ -71,6 +75,47 @@ def _current_user_id_from_jwt():
 def serve_file(subpath):
     root = os.path.abspath(current_app.config["UPLOAD_DIR"])
     return send_from_directory(root, subpath)
+
+
+# ===== AI 智能分析 =====
+@bp.post("/api/v1/images/ai-analyze")
+@jwt_required()
+def ai_analyze_image():
+    """接收临时图片，调用 DashScope 进行自动描述与标签分析。"""
+    g.user_id = _current_user_id_from_jwt()
+    fs = request.files.get("file")
+    if not fs:
+        return jsonify({"ok": False, "error": "请先上传要分析的图片文件"}), 400
+
+    ext = (fs.filename.rsplit(".", 1)[-1] or "").lower() if fs.filename else ""
+    mime = (fs.mimetype or "").lower()
+    if ext not in ALLOWED_EXTS or mime not in ALLOWED_MIMES:
+        return jsonify({"ok": False, "error": "仅支持常见图片格式"}), 400
+
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix="ai_", suffix=f".{ext or 'jpg'}", dir=TMP_AI_DIR)
+        os.close(fd)
+        fs.save(temp_path)
+
+        result = analyze_image(temp_path)
+        return jsonify(
+            {
+                "ok": True,
+                "title": result.get("title") or "",
+                "description": result.get("description") or "",
+                "tags": result.get("tags") or [],
+            }
+        )
+    except Exception as exc:
+        msg = str(exc) or "AI 分析失败"
+        return jsonify({"ok": False, "error": msg}), 500
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 # ===== 上传 =====

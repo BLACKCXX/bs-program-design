@@ -3,6 +3,7 @@ import { ref, reactive, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
 import api from '../api/http' // 预留：接入真实后端时可直接使用
+import { useAiAnalyzer } from '../utils/useAiAnalyzer'
 
 // 父组件通过 v-model 控制开关；tagOptions 用于“与左侧筛选一致”的标签列表（动态）
 const props = defineProps({
@@ -39,9 +40,26 @@ function reset() {
   fileList.value = []
 }
 
+// 合并标签并去重，保留已有选择
+function mergeTags(newTags = []) {
+  const incoming = Array.isArray(newTags) ? newTags : [newTags].filter(Boolean)
+  const merged = new Set(form.tags || [])
+  incoming.forEach(t => {
+    const name = (t || '').toString().trim()
+    if (name) merged.add(name)
+  })
+  form.tags = Array.from(merged)
+}
+
+// 清空当前选择但不关闭弹窗
+function clearSelection() {
+  reset()
+}
+
 const uploading = ref(false)
 // ⚠️ 现在用模拟上传；接入后端时把 USE_MOCK=false，并放开 api.post('/api/upload', ...)
 const USE_MOCK = false
+const { analyzing, analyze: analyzeByAI } = useAiAnalyzer({ form, fileList, mergeTags })
 
 async function submit() {
   if (!fileList.value.length) return
@@ -130,6 +148,8 @@ function onCancel() {
             allow-create
             default-first-option
             collapse-tags
+            :max-collapse-tags="4"
+            :reserve-keyword="false"
             placeholder="选择或输入标签"
             style="width:100%;"
           >
@@ -142,7 +162,11 @@ function onCancel() {
     <template #footer>
       <div class="footer">
         <el-button @click="onCancel">取消</el-button>
-        <el-button type="primary" :disabled="!fileList.length" :loading="uploading" @click="submit">开始上传</el-button>
+        <el-button :disabled="!fileList.length || uploading || analyzing" @click="clearSelection">清空选择</el-button>
+        <el-button type="primary" plain :disabled="!fileList.length || uploading || analyzing" :loading="analyzing" @click="analyzeByAI">
+          AI 智能分析
+        </el-button>
+        <el-button type="primary" :disabled="!fileList.length || analyzing" :loading="uploading" @click="submit">开始上传</el-button>
       </div>
     </template>
   </el-dialog>

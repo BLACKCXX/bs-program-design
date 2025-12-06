@@ -425,6 +425,9 @@ onMounted(fetchTags)*/
         :loading="tagLoading"
         allow-create
         default-first-option
+        collapse-tags
+        :max-collapse-tags="4"
+        :reserve-keyword="false"
         placeholder="选择或创建标签"
         style="width: 100%;"
       >
