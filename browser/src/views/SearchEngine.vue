@@ -1,29 +1,27 @@
 <script setup>
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Search, Refresh, Calendar, Picture } from '@element-plus/icons-vue'
+import { Search, Refresh, Picture } from '@element-plus/icons-vue'
+import DateRangeInput from '../components/DateRangeInput.vue'
 import api from '../api/http'
+import { toDisplayUrl } from '../utils/url'
 
-const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '')
-const toAbs = (p) => {
-  if (!p) return ''
-  return p.startsWith('http') ? p : `${API}${p}`
-}
+const toAbs = (p) => toDisplayUrl(p)
 
 const layoutMode = ref('grid')
 
 const filters = reactive({
   keyword: '',
-  dateRange: [],
   dateStart: '',
   dateEnd: '',
   format: '',
   cameraMake: '',
   cameraModel: '',
+  device: [],
   iso: '',
   focalLength: '',
   minSizeMB: 0,
-  maxSizeMB: 200,
+  maxSizeMB: 10,
   tags: [],
 })
 
@@ -35,12 +33,14 @@ const results = ref([])
 
 const loadingTags = ref(false)
 const tagOptions = ref([])
+const facets = reactive({ camera_make: [], camera_model: [], format: [], device: [] })
+const facetsLoaded = ref(false)
 
 const sizeRange = computed({
   get: () => [filters.minSizeMB, filters.maxSizeMB],
   set: (val = []) => {
     filters.minSizeMB = Number(val?.[0] ?? 0)
-    filters.maxSizeMB = Number(val?.[1] ?? 200)
+    filters.maxSizeMB = Number(val?.[1] ?? 10)
   },
 })
 
@@ -48,25 +48,11 @@ const resultCount = computed(() => results.value.length)
 
 function formatDateInput(val) {
   if (!val) return ''
-  const d = typeof val === 'string' ? new Date(val) : val
+  if (typeof val === 'string') return val.slice(0, 10)
+  const d = new Date(val)
   if (Number.isNaN(d.getTime())) return ''
   return d.toISOString().slice(0, 10)
 }
-
-watch(
-  () => filters.dateRange,
-  (val) => {
-    if (Array.isArray(val) && val.length === 2 && val[0] && val[1]) {
-      filters.dateStart = formatDateInput(val[0])
-      filters.dateEnd = formatDateInput(val[1])
-    } else {
-      filters.dateStart = ''
-      filters.dateEnd = ''
-      activeQuick.value = ''
-    }
-  },
-  { deep: true }
-)
 
 // 高级筛选变更后自动触发搜索（防抖）
 let debounceTimer
@@ -83,6 +69,7 @@ watch(
     format: filters.format,
     cameraMake: filters.cameraMake,
     cameraModel: filters.cameraModel,
+    device: [...filters.device],
     iso: filters.iso,
     focalLength: filters.focalLength,
     minSizeMB: filters.minSizeMB,
@@ -112,6 +99,7 @@ const loadSearchResults = async () => {
     if (filters.dateStart) params.date_start = filters.dateStart
     if (filters.dateEnd) params.date_end = filters.dateEnd
     if (filters.format) params.format = filters.format.trim()
+    if (filters.device.length) params.device = filters.device
 
     const cameraMake = filters.cameraMake.trim()
     const cameraModel = filters.cameraModel.trim()
@@ -121,10 +109,10 @@ const loadSearchResults = async () => {
     if (cameraModel) params.camera_model = cameraModel
     if (iso) params.iso = iso
     if (focal) params.focal_length = focal
-    const sizeTouched = filters.minSizeMB > 0 || filters.maxSizeMB < 200
+    const sizeTouched = filters.minSizeMB > 0 || filters.maxSizeMB < 10
     if (sizeTouched) {
       params.min_size_mb = filters.minSizeMB
-      params.max_size_mb = filters.maxSizeMB
+      params.max_size_mb = Math.min(filters.maxSizeMB, 10)
     }
     if (filters.tags.length) params.tags = filters.tags
 
@@ -149,22 +137,36 @@ const loadTagOptions = async (keyword = '') => {
   }
 }
 
+const loadFacets = async () => {
+  if (facetsLoaded.value) return
+  try {
+    const { data } = await api.get('/api/images/facets')
+    facets.camera_make = data?.camera_make || []
+    facets.camera_model = data?.camera_model || []
+    facets.format = data?.format || []
+    facets.device = data?.device || []
+    facetsLoaded.value = true
+  } catch (err) {
+    ElMessage.warning(err?.response?.data?.error || '获取筛选建议失败')
+  }
+}
+
 const onSearch = () => {
   loadSearchResults()
 }
 
 const onReset = () => {
   filters.keyword = ''
-  filters.dateRange = []
   filters.dateStart = ''
   filters.dateEnd = ''
   filters.format = ''
   filters.cameraMake = ''
   filters.cameraModel = ''
+  filters.device = []
   filters.iso = ''
   filters.focalLength = ''
   filters.minSizeMB = 0
-  filters.maxSizeMB = 200
+  filters.maxSizeMB = 10
   filters.tags = []
   activeQuick.value = ''
   cancelScheduledLoad()
@@ -183,11 +185,13 @@ const applyQuick = (label) => {
   } else if (label === '最近一月') {
     start.setDate(end.getDate() - 29)
   }
-  filters.dateRange = [start, end]
+  filters.dateStart = formatDateInput(start)
+  filters.dateEnd = formatDateInput(end)
   activeQuick.value = label
 }
 
 onMounted(() => {
+  loadFacets()
   loadTagOptions()
   loadSearchResults()
 })
@@ -226,14 +230,10 @@ onMounted(() => {
         <el-form label-position="top">
           <div class="row">
             <el-form-item label="拍摄/上传时间">
-              <el-date-picker
-                v-model="filters.dateRange"
-                type="daterange"
-                start-placeholder="开始日期"
-                end-placeholder="结束日期"
-                unlink-panels
-                :prefix-icon="Calendar"
-                style="width: 100%;"
+              <DateRangeInput
+                v-model:start="filters.dateStart"
+                v-model:end="filters.dateEnd"
+                size="large"
               />
               <div class="quick-range">
                 <el-check-tag
@@ -248,11 +248,13 @@ onMounted(() => {
             </el-form-item>
 
             <el-form-item label="图片格式">
-              <el-select v-model="filters.format" placeholder="选择需要的文件格式" clearable>
-                <el-option label="JPG" value="jpg" />
-                <el-option label="PNG" value="png" />
-                <el-option label="WEBP" value="webp" />
-                <el-option label="HEIC" value="heic" />
+              <el-select v-model="filters.format" placeholder="选择需要的文件格式" clearable filterable>
+                <el-option
+                  v-for="opt in facets.format"
+                  :key="opt.value"
+                  :label="`${opt.value}（${opt.count}）`"
+                  :value="opt.value"
+                />
               </el-select>
             </el-form-item>
           </div>
@@ -260,8 +262,34 @@ onMounted(() => {
           <div class="row">
             <el-form-item label="EXIF 维度">
               <div class="exif-grid">
-                <el-input v-model="filters.cameraMake" placeholder="相机品牌" clearable />
-                <el-input v-model="filters.cameraModel" placeholder="相机型号" clearable />
+                <el-select
+                  v-model="filters.cameraMake"
+                  placeholder="相机品牌"
+                  clearable
+                  filterable
+                  allow-create
+                >
+                  <el-option
+                    v-for="opt in facets.camera_make"
+                    :key="opt.value"
+                    :label="`${opt.value}（${opt.count}）`"
+                    :value="opt.value"
+                  />
+                </el-select>
+                <el-select
+                  v-model="filters.cameraModel"
+                  placeholder="相机型号"
+                  clearable
+                  filterable
+                  allow-create
+                >
+                  <el-option
+                    v-for="opt in facets.camera_model"
+                    :key="opt.value"
+                    :label="`${opt.value}（${opt.count}）`"
+                    :value="opt.value"
+                  />
+                </el-select>
                 <el-input v-model="filters.iso" placeholder="ISO (如 100)" clearable />
                 <el-input v-model="filters.focalLength" placeholder="焦距 (如 35)" clearable />
               </div>
@@ -269,8 +297,28 @@ onMounted(() => {
           </div>
 
           <div class="row">
-            <el-form-item label="文件大小 (MB)">
-              <el-slider v-model="sizeRange" :max="200" range :show-tooltip="true" />
+            <el-form-item label="拍摄设备">
+              <el-select
+                v-model="filters.device"
+                multiple
+                filterable
+                clearable
+                placeholder="选择设备类型"
+                style="width: 100%;"
+              >
+                <el-option
+                  v-for="opt in facets.device"
+                  :key="opt.value"
+                  :label="`${opt.value}（${opt.count}）`"
+                  :value="opt.value"
+                />
+              </el-select>
+            </el-form-item>
+          </div>
+
+          <div class="row">
+            <el-form-item label="文件大小 (0-10MB)">
+              <el-slider v-model="sizeRange" :max="10" :step="0.1" range :show-tooltip="true" />
               <div class="size-meta">{{ filters.minSizeMB }} - {{ filters.maxSizeMB }} MB</div>
             </el-form-item>
           </div>

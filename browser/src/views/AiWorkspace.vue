@@ -1,35 +1,306 @@
 <script setup>
-import { ref } from 'vue'
+import { nextTick, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { MagicStick, ChatLineRound, Loading } from '@element-plus/icons-vue'
+import { storeToRefs } from 'pinia'
+import api from '../api/http'
+import { useAiWorkspaceStore } from '../stores/aiWorkspace'
+import { toDisplayUrl } from '../utils/url'
+
+const router = useRouter()
+const workspaceStore = useAiWorkspaceStore()
+workspaceStore.hydrate()
+
+const { messages, tagSuggestions, lastQuery } = storeToRefs(workspaceStore)
+const toAbs = (p) => toDisplayUrl(p)
 
 const quickPrompts = [
-  '找几张人物和城市夜景的照片',
-  '有哪些动物主题的图片？',
+  '帮我找几张晚霞的照片',
+  '有哪些城市夜景和人物的图片？',
   '列出最近上传的风景照',
-  '帮我找有花和微距的作品',
+  '找找看有花朵和微距的作品',
 ]
-
-const messages = ref([
-  { role: 'ai', content: '嗨，我是 AI 图片助手，问我“帮我找夜景的照片”试试？' },
-])
 
 const input = ref('')
 const sending = ref(false)
+const typingMsg = ref(null)
+const messagesEl = ref(null)
+const allTags = ref([])
+const loadingTags = ref(false)
+const requestId = ref(0)
 
-const send = (preset) => {
+const synonymMap = {
+  风景: ['景色', '自然', '山水'],
+  夜景: ['夜晚', '夜色'],
+  人物: ['人像', '肖像'],
+  建筑: ['楼宇', '街景', '城市建筑'],
+  旅行: ['旅途', '旅游'],
+  自然: ['户外', '森林'],
+  美食: ['美味', '料理'],
+}
+
+const ensureHistory = () => {
+  if (!messages.value.length) {
+    workspaceStore.reset()
+  }
+}
+
+const loadAllTags = async () => {
+  if (loadingTags.value || allTags.value.length) return
+  loadingTags.value = true
+  try {
+    const { data } = await api.get('/api/tags')
+    allTags.value = Array.isArray(data) ? data : []
+  } catch (err) {
+    console.warn('[aiWorkspace] load tags failed', err)
+  } finally {
+    loadingTags.value = false
+  }
+}
+
+const tokenize = (text = '') => {
+  const base = (text || '').trim()
+  if (!base) return []
+  const parts = base.split(/[\s,，。；;、/]+/).filter(Boolean)
+  if (base.length >= 2) {
+    for (let i = 0; i < base.length - 1; i += 1) {
+      const seg = base.slice(i, i + 2).trim()
+      if (seg && !parts.includes(seg)) parts.push(seg)
+    }
+  }
+  return parts.slice(0, 12)
+}
+
+const latestResultsFromHistory = () => {
+  const reversed = [...messages.value].reverse()
+  const found = reversed.find((msg) => Array.isArray(msg.results) && msg.results.length)
+  return found?.results || []
+}
+
+const refreshTagSuggestions = (query = '', results = []) => {
+  const tokens = tokenize(query)
+  const freq = {}
+  results.forEach((res) => {
+    ;(res?.tags || []).forEach((t) => {
+      const name = (t || '').trim()
+      if (name) freq[name] = (freq[name] || 0) + 1
+    })
+  })
+  const candidates = new Set([...allTags.value, ...Object.keys(freq)])
+  const scored = []
+  candidates.forEach((tag) => {
+    const name = (tag || '').toString().trim()
+    if (!name) return
+    const lower = name.toLowerCase()
+    let score = (freq[name] || 0) * 1.2
+    tokens.forEach((tok) => {
+      const lt = tok.toLowerCase()
+      if (!lt) return
+      if (lower === lt) score += 4
+      else if (lower.includes(lt)) score += 2.6
+      else if (lt.includes(lower)) score += 2
+      else {
+        const overlap = [...new Set(lt.split(''))].filter((ch) => lower.includes(ch)).length
+        score += overlap * 0.3
+      }
+    })
+    Object.entries(synonymMap).forEach(([base, syns]) => {
+      if (base === name || syns.includes(name)) {
+        const hit = tokens.some((t) => base.includes(t) || syns.some((s) => s.includes(t)))
+        if (hit) score += 2.2
+      }
+    })
+    scored.push({ tag: name, score })
+  })
+  scored.sort((a, b) => b.score - a.score || a.tag.localeCompare(b.tag, 'zh-Hans-CN'))
+  workspaceStore.setTagSuggestions(scored.slice(0, 12).map((it) => it.tag))
+  workspaceStore.persist()
+}
+
+const scrollToBottom = async () => {
+  await nextTick()
+  const el = messagesEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+const removeTyping = () => {
+  if (typingMsg.value) {
+    const idx = messages.value.indexOf(typingMsg.value)
+    if (idx >= 0) messages.value.splice(idx, 1)
+    typingMsg.value = null
+  }
+}
+
+const filterStrongResults = (list = []) => {
+  return (list || []).filter((item) => {
+    const fields = new Set(item.matchedFields || item.matched_fields || [])
+    const score = Number(item.score ?? item.match_score ?? 0)
+    if (!fields.size) return false
+    if (fields.has('tags') || fields.has('title')) return score >= 2.5
+    return score >= 3.0
+  })
+}
+
+const normalizeResult = (item = {}) => {
+  const tags = Array.isArray(item.tags) ? [...item.tags] : []
+  const suggested = Array.isArray(item.suggestedTags) ? [...item.suggestedTags] : []
+  const cover = toAbs(item.coverUrl || item.thumbUrl || '')
+  const thumb = toAbs(item.thumbUrl || item.coverUrl || '')
+  const detailUrl = item.detailUrl || item.detail_url || (item.id ? `/images/${item.id}` : '')
+  const matchedFields = Array.isArray(item.matchedFields)
+    ? item.matchedFields
+    : Array.isArray(item.matched_fields)
+      ? item.matched_fields
+      : []
+  return {
+    id: item.id,
+    title: item.title || '未命名',
+    description: item.description || '',
+    shortCaption: item.shortCaption || item.description || '',
+    coverUrl: cover || thumb,
+    thumbUrl: thumb || cover,
+    tags,
+    suggestedTags: suggested,
+    matchedFields,
+    detailUrl,
+    score: item.score != null ? item.score : null,
+  }
+}
+
+// 发送检索请求，使用 AI 兜底补充推荐标签
+const send = async (preset) => {
   const content = (preset ?? input.value).trim()
-  if (!content) return
-  messages.value.push({ role: 'user', content })
+  if (!content || sending.value) return
+  const currentReq = ++requestId.value
+  // 清空旧的 results，避免残留或覆盖
+  workspaceStore.setMessages(workspaceStore.messages.filter((m) => m.type !== 'results'))
+  const userMsg = { role: 'user', type: 'text', content }
+  workspaceStore.pushMessage(userMsg)
+  workspaceStore.setLastQuery(content)
+  workspaceStore.persist()
+  await scrollToBottom()
+
   input.value = ''
   sending.value = true
-  setTimeout(() => {
-    messages.value.push({
+  typingMsg.value = { role: 'ai', type: 'typing', id: `typing-${Date.now()}` }
+  messages.value.push(typingMsg.value)
+  await scrollToBottom()
+  refreshTagSuggestions(content, latestResultsFromHistory())
+
+  try {
+    const { data } = await api.post('/api/ai/chat-search', { message: content })
+    if (currentReq !== requestId.value) return
+    const isError = data && data.ok === false
+    removeTyping()
+    if (isError) {
+      const msg = data.error || data.detail || '检索失败'
+      ElMessage.error(msg)
+      workspaceStore.pushMessage({ role: 'ai', type: 'text', content: msg })
+      workspaceStore.persist()
+      await scrollToBottom()
+      return
+    }
+
+    const filtered = filterStrongResults(data?.results || [])
+    const results = filtered.map(normalizeResult)
+    if (!results.length) {
+      workspaceStore.pushMessage({
+        role: 'ai',
+        type: 'text',
+        content: `未找到与「${content}」强相关的图片（请确认是否已为图片打过该标签）。`,
+      })
+      workspaceStore.persist()
+      await scrollToBottom()
+      return
+    }
+    refreshTagSuggestions(content, results)
+    workspaceStore.pushMessage({
       role: 'ai',
-      content: `AI 已收到：${content}，我会在真实接口接入后帮你筛选匹配的图片。`,
+      type: 'results',
+      content: data?.reply || '这是为你找到的结果：',
+      results,
     })
+    workspaceStore.persist()
+  } catch (err) {
+    if (currentReq !== requestId.value) return
+    removeTyping()
+    const msg = err?.response?.data?.error || err?.response?.data?.detail || '检索失败'
+    ElMessage.error(msg)
+    workspaceStore.pushMessage({ role: 'ai', type: 'text', content: msg })
+    workspaceStore.persist()
+  } finally {
+    removeTyping()
     sending.value = false
-  }, 600)
+    await scrollToBottom()
+  }
 }
+
+const applyTagSuggestion = (tag) => {
+  const name = (tag || '').trim()
+  if (!name) return
+  input.value = name
+  if (!sending.value) {
+    send(name)
+  }
+}
+
+const openDetail = (payload) => {
+  if (!payload) return
+  const detailUrl = typeof payload === 'object' ? payload.detailUrl : null
+  const id = typeof payload === 'object' ? payload.id : payload
+  if (detailUrl) {
+    router.push(detailUrl)
+    return
+  }
+  if (id) {
+    router.push({ name: 'ImageDetail', params: { id } })
+  }
+}
+
+const removeSuggested = (res, tag) => {
+  if (!Array.isArray(res.suggestedTags)) return
+  const idx = res.suggestedTags.indexOf(tag)
+  if (idx >= 0) res.suggestedTags.splice(idx, 1)
+}
+
+// 采纳 AI 推荐标签：写入后端并更新当前卡片的标签列表
+const acceptTag = async (res, tag) => {
+  if (!res?.id) return
+  try {
+    const { data } = await api.post(`/api/images/${res.id}/tags/accept_suggestions`, { tags: [tag] })
+    const returned = Array.isArray(data?.tags) ? data.tags : []
+    res.tags = returned.length ? returned : Array.from(new Set([...(res.tags || []), tag]))
+    ElMessage.success('已采纳标签')
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '采纳标签失败')
+    return
+  }
+  removeSuggested(res, tag)
+}
+
+const rejectTag = (res, tag) => {
+  removeSuggested(res, tag)
+}
+
+onMounted(async () => {
+  ensureHistory()
+  await nextTick()
+  await scrollToBottom()
+  await loadAllTags()
+  if (lastQuery.value) {
+    refreshTagSuggestions(lastQuery.value, latestResultsFromHistory())
+  } else {
+    refreshTagSuggestions('', latestResultsFromHistory())
+  }
+})
+
+watch(
+  () => input.value,
+  (val) => {
+    if (!sending.value) refreshTagSuggestions(val, latestResultsFromHistory())
+  }
+)
 </script>
 
 <template>
@@ -37,9 +308,9 @@ const send = (preset) => {
     <div class="header">
       <div>
         <h2>AI 工作台 · 智能图片检索</h2>
-        <p class="sub">与大模型对话，检索你的图片资产，或者让它帮你找灵感</p>
+        <p class="sub">与大模型对话，检索你的图片资产，或让它额外做内容分析补全结果</p>
       </div>
-      <el-tag type="success" effect="plain">实验室 · 本地模拟</el-tag>
+      <el-tag type="success" effect="plain">支持兜底内容分析</el-tag>
     </div>
 
     <div class="card prompt-card">
@@ -67,21 +338,77 @@ const send = (preset) => {
           <el-icon><ChatLineRound /></el-icon>
           <span>对话区</span>
         </div>
-        <el-tag type="warning" effect="plain">未来可连后端检索</el-tag>
+        <el-tag type="warning" effect="plain">已接入 AI 检索与推荐标签</el-tag>
       </div>
-      <div class="messages">
-        <div
-          v-for="(msg, idx) in messages"
-          :key="idx"
-          class="bubble-row"
-          :class="msg.role"
-        >
-          <div class="bubble">
-            <span v-if="msg.role === 'ai'" class="label">AI</span>
-            <span v-else class="label user">Me</span>
-            <p>{{ msg.content }}</p>
-          </div>
+      <div v-if="tagSuggestions?.length" class="tag-suggest">
+        <div class="tag-suggest-title">AI 推荐标签（基于图库已有标签）</div>
+        <div class="tag-suggest-list">
+          <el-check-tag
+            v-for="tag in tagSuggestions"
+            :key="tag"
+            class="tag-suggest-chip"
+            @click="applyTagSuggestion(tag)"
+          >
+            {{ tag }}
+          </el-check-tag>
         </div>
+      </div>
+      <div class="messages" ref="messagesEl">
+        <transition-group name="msg-fade" tag="div">
+          <div
+            v-for="(msg, idx) in messages"
+            :key="msg.id || idx"
+            class="bubble-row"
+            :class="msg.role"
+          >
+            <div class="bubble">
+              <span v-if="msg.role === 'ai'" class="label">AI</span>
+              <span v-else class="label user">Me</span>
+              <p v-if="msg.type === 'text' && msg.content">{{ msg.content }}</p>
+              <div v-else-if="msg.type === 'typing'" class="typing-dots">
+                <span></span><span></span><span></span>
+              </div>
+              <div v-else-if="msg.results?.length" class="result-grid">
+                <div
+                  v-for="item in msg.results"
+                  :key="item.id || item.detailUrl"
+                  class="result-card"
+                  @click="openDetail(item)"
+                >
+                  <div class="thumb" :style="item.thumbUrl ? { backgroundImage: `url(${item.thumbUrl})` } : {}">
+                    <span v-if="!item.thumbUrl" class="thumb-placeholder">No Image</span>
+                  </div>
+                  <div class="meta">
+                    <h4 class="title">{{ item.title }}</h4>
+                    <p class="caption">{{ item.shortCaption || item.description || '暂无描述' }}</p>
+                    <div class="match-info" v-if="item.matchedFields?.length || item.score">
+                      <span v-if="item.score" class="score-pill">得分 {{ Number(item.score).toFixed(2) }}</span>
+                      <span v-if="item.matchedFields?.length" class="matched-fields">命中: {{ item.matchedFields.join('、') }}</span>
+                    </div>
+                    <div class="tag-row">
+                      <el-tag v-for="t in item.tags" :key="t" size="small" effect="plain">{{ t }}</el-tag>
+                      <span v-if="!item.tags?.length" class="tag-empty">暂无标签</span>
+                    </div>
+                    <div v-if="item.suggestedTags?.length" class="suggest">
+                      <span class="suggest-label">AI 推荐标签：</span>
+                      <div class="suggest-tags">
+                        <div v-for="t in item.suggestedTags" :key="t" class="suggest-item">
+                          <el-tag type="warning" size="small" effect="plain">{{ t }}</el-tag>
+                          <el-button text size="small" @click.stop="acceptTag(item, t)">采纳</el-button>
+                          <el-button text size="small" @click.stop="rejectTag(item, t)">拒绝</el-button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div v-else-if="msg.role === 'ai'" class="result-empty">
+                <p>暂时没有命中图片，试试调整关键词或让 AI 推荐标签？</p>
+                <el-button size="small" type="primary" @click="send('推荐一些相关标签，帮助我搜索图片')">让 AI 推荐标签</el-button>
+              </div>
+            </div>
+          </div>
+        </transition-group>
       </div>
       <div class="composer">
         <el-input
@@ -180,15 +507,58 @@ const send = (preset) => {
   font-weight: 700;
 }
 
+.tag-suggest {
+  background: #f9fbff;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.tag-suggest-title {
+  color: var(--primary-strong);
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.tag-suggest-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tag-suggest-chip {
+  border-radius: 999px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  background: #fff;
+  cursor: pointer;
+}
+
+.tag-suggest-chip:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
 .messages {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  min-height: 220px;
+  min-height: 260px;
   padding: 8px;
   background: #f0f5ff;
   border-radius: 12px;
   border: 1px dashed var(--border);
+  overflow-y: auto;
+}
+
+.msg-fade-enter-active,
+.msg-fade-leave-active {
+  transition: all 0.2s ease;
+}
+.msg-fade-enter-from,
+.msg-fade-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
 }
 
 .bubble-row {
@@ -200,12 +570,13 @@ const send = (preset) => {
 }
 
 .bubble {
-  max-width: 76%;
+  max-width: 96%;
   background: #fff;
   border-radius: 14px;
   padding: 10px 12px;
   border: 1px solid var(--border);
   box-shadow: 0 8px 18px rgba(75, 140, 255, 0.08);
+  width: 100%;
 }
 
 .bubble-row.user .bubble {
@@ -213,8 +584,28 @@ const send = (preset) => {
 }
 
 .bubble p {
-  margin: 6px 0 0;
+  margin: 6px 0 8px;
   color: var(--text);
+}
+
+.typing-dots {
+  display: inline-flex;
+  gap: 4px;
+  padding: 6px 0;
+}
+.typing-dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--primary);
+  opacity: 0.6;
+  animation: blink 1s infinite ease-in-out;
+}
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink {
+  0%, 100% { opacity: 0.2; transform: translateY(0); }
+  50% { opacity: 1; transform: translateY(-2px); }
 }
 
 .label {
@@ -239,18 +630,187 @@ const send = (preset) => {
 
 .composer :deep(.el-textarea__inner) {
   border-radius: 12px;
-  border-color: var(--border);
-  background: #fff;
 }
 
-@media (max-width: 720px) {
+.result-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.result-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: #f8fbff;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.result-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 10px 22px rgba(75, 140, 255, 0.18);
+}
+.match-info {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.score-pill {
+  background: #ecfdf3;
+  color: #166534;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-weight: 700;
+}
+.matched-fields {
+  color: #6b7280;
+}
+
+.thumb {
+  aspect-ratio: 4 / 3;
+  background-size: cover;
+  background-position: center;
+  background-color: #eef2ff;
+  display: grid;
+  place-items: center;
+}
+
+.thumb-placeholder {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.meta {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meta .title {
+  margin: 0;
+  color: #1f2937;
+  font-size: 15px;
+}
+
+.caption {
+  margin: 0;
+  color: #6b7280;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-empty {
+  color: #9aa0a6;
+  font-size: 12px;
+}
+
+.suggest {
+  background: #fff7ed;
+  border: 1px dashed #fdba74;
+  border-radius: 8px;
+  padding: 6px;
+}
+
+.suggest-label {
+  font-size: 12px;
+  color: #c2410c;
+}
+
+.suggest-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: #fff;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+.result-empty {
+  margin-top: 8px;
+  padding: 10px;
+  background: #fff7ed;
+  border: 1px dashed #fdba74;
+  border-radius: 8px;
+  color: #c2410c;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 768px) {
+  .ai-page {
+    gap: 12px;
+  }
+
+  .header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .card {
+    padding: 12px;
+  }
+
+  .prompt-buttons {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .prompt-buttons :deep(.el-button) {
+    width: 100%;
+    justify-content: flex-start;
+    min-height: 44px;
+  }
+
+  .chat-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .messages {
+    max-height: 55vh;
+    min-height: 220px;
+  }
+
+  .bubble {
+    max-width: 100%;
+  }
+
+  .result-grid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  }
+
   .composer {
     flex-direction: column;
     align-items: stretch;
   }
 
-  .bubble {
-    max-width: 100%;
+  .composer :deep(.el-button) {
+    width: 100%;
+    min-height: 46px;
   }
 }
 </style>

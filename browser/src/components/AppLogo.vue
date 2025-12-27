@@ -1,3 +1,10 @@
+<script setup>
+// allow hiding wordmark to avoid duplicated text when overlaying hero titles
+const props = defineProps({
+  showText: { type: Boolean, default: true },
+})
+</script>
+
 <template>
   <div class="logo-wrap">
     <!-- 简洁图标：占位方块+图片小图标，你后续可换成 svg 文件 -->
@@ -5,7 +12,7 @@
       <span class="dot"></span>
       <span class="mountain"></span>
     </div>
-    <div class="title">Private Picture Shop</div>
+    <div v-if="showText" class="title">Private Picture Shop</div>
   </div>
 </template>
 
@@ -15,6 +22,7 @@
   width:72px; height:72px; border-radius:20px;
   background: #eaf2ff; display:grid; place-items:center;
   box-shadow: 0 6px 18px rgba(22, 93, 255, 0.08) inset;
+  position: relative;
 }
 .icon .dot {
   width:10px; height:10px; border-radius:50%; background:#3b82f6;

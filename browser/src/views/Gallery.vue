@@ -7,14 +7,15 @@
 // ===== 页面逻辑：仅前端态，不依赖后端 =====
 import { ref, reactive, computed, onMounted, watch } from 'vue'
 import UploadDialog from '../components/UploadDialog.vue'
+import DateRangeInput from '../components/DateRangeInput.vue'
 import { ElMessage } from 'element-plus'
 import { Search, Upload, Download, Delete, PriceTag } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 import api from '../api/http' // 预留：将来可从 /api/tags 获取真实标签
+import { toDisplayUrl } from '../utils/url'
 //import api from '../api/http'
 const store = useAuthStore()
-const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '')
-const toAbs = (p) => (p?.startsWith('http') ? p : API + p)
+const toAbs = (p) => toDisplayUrl(p)
 // —— 顶部控件 —— //
 const bulkMode = ref(false)
 const selectedIds = ref([]) // #advise 批量模式选中列表
@@ -23,13 +24,16 @@ const selectedIds = ref([]) // #advise 批量模式选中列表
 const filters = reactive({
   keyword: '',        // #advise 顶部搜索关键字
   tags: [],           // 选中的标签
-  dateRange: [],      // [开始, 结束]
-  sizeMB: [0, 100],   // 0~100 MB
+  dateStart: '',      // 开始日期
+  dateEnd: '',        // 结束日期
+  sizeMB: [0, 10],   // 0~10 MB
   devices: [],        // 设备（占位：手机/相机/平板）
 })
 const tagKeyword = ref('')       // #advise 标签搜索关键字（标签+图片标题模糊）
 const popularTags = ref([])      // #advise 左侧显示的热门标签（仅前5）
 const uploadTagOptions = computed(() => popularTags.value.map((t) => t.name))
+const facets = reactive({ device: [], camera_make: [], camera_model: [], format: [] })
+const facetLoaded = ref(false)
 
 // —— 数据源（演示数据开关）—— //
 // 说明：现在用 DEMO 数据；上线后只要换成接口数据即可；标签会自动跟着数据变化
@@ -56,6 +60,7 @@ const tagLoading = ref(false)
 
 const formatDate = (val) => {
   if (!val) return ''
+  if (typeof val === 'string') return val.slice(0, 10)
   const d = new Date(val)
   return Number.isNaN(d.getTime()) ? '' : d.toISOString().slice(0, 10)
 }
@@ -65,12 +70,12 @@ const buildParams = () => {
   const kw = (filters.keyword || '').trim()
   if (kw) params.q = kw
   if (filters.tags.length) params.tags = filters.tags
-  if (filters.dateRange?.length === 2) {
-    params.date_start = formatDate(filters.dateRange[0])
-    params.date_end = formatDate(filters.dateRange[1])
-  }
-  params.min_size_mb = Number(filters.sizeMB?.[0] ?? 0)
-  params.max_size_mb = Number(filters.sizeMB?.[1] ?? 100)
+  const ds = formatDate(filters.dateStart)
+  const de = formatDate(filters.dateEnd)
+  if (ds) params.date_start = ds
+  if (de) params.date_end = de
+  params.min_size_mb = Math.max(0, Number(filters.sizeMB?.[0] ?? 0))
+  params.max_size_mb = Math.min(10, Number(filters.sizeMB?.[1] ?? 10))
   return params
 }
 
@@ -84,7 +89,7 @@ const loadImages = async () => {
       tags: it.tags,
       date: it.date,
       sizeMB: it.sizeMB,
-      device: '',
+      device: it.device || '',
       cover: toAbs(it.url),
       description: it.description,
     }))
@@ -102,6 +107,20 @@ const fetchPopularTags = async () => {
     popularTags.value = sorted.slice(0, 5)
   } catch (err) {
     console.error(err)
+  }
+}
+
+const loadFacets = async () => {
+  if (facetLoaded.value) return
+  try {
+    const { data } = await api.get('/api/images/facets')
+    facets.device = data?.device || []
+    facets.camera_make = data?.camera_make || []
+    facets.camera_model = data?.camera_model || []
+    facets.format = data?.format || []
+    facetLoaded.value = true
+  } catch (err) {
+    ElMessage.warning(err?.response?.data?.error || '获取筛选建议失败')
   }
 }
 
@@ -224,7 +243,7 @@ const confirmAddTags = async () => {
 
 let filterTimer
 watch(
-  () => ({ ...filters, tags: [...filters.tags], dateRange: [...filters.dateRange], sizeMB: [...filters.sizeMB] }),
+  () => ({ ...filters, tags: [...filters.tags], sizeMB: [...filters.sizeMB] }),
   () => {
     clearTimeout(filterTimer)
     filterTimer = setTimeout(loadImages, 400)
@@ -234,14 +253,16 @@ watch(
 
 onMounted(() => {
   fetchPopularTags()
+  loadFacets()
   loadImages()
 })
 
 const resetFilters = () => {
   filters.keyword = ''
   filters.tags = []
-  filters.dateRange = []
-  filters.sizeMB = [0, 100]
+  filters.dateStart = ''
+  filters.dateEnd = ''
+  filters.sizeMB = [0, 10]
   filters.devices = []
   loadImages()
 }
@@ -356,27 +377,37 @@ onMounted(fetchTags)*/
 
         <div class="block">
           <div class="block-title">时间范围</div>
-          <el-date-picker
-            v-model="filters.dateRange"
-            type="daterange"
-            start-placeholder="开始日期"
-            end-placeholder="结束日期"
-            range-separator="至"
-            unlink-panels
-            style="width:100%;"
+          <DateRangeInput
+            v-model:start="filters.dateStart"
+            v-model:end="filters.dateEnd"
+            placeholder-start="开始日期"
+            placeholder-end="结束日期"
+            size="small"
           />
         </div>
 
         <div class="block">
-          <div class="block-title">文件大小 (0MB - 100MB)</div>
-          <el-slider v-model="filters.sizeMB" range :min="0" :max="100" />
+          <div class="block-title">文件大小 (0MB - 10MB)</div>
+          <el-slider v-model="filters.sizeMB" range :min="0" :max="10" />
         </div>
 
         <div class="block">
           <div class="block-title">拍摄设备</div>
-          <el-checkbox-group v-model="filters.devices" class="v-list">
-            <el-checkbox label="手机" /><el-checkbox label="相机" /><el-checkbox label="平板" />
-          </el-checkbox-group>
+          <el-select
+            v-model="filters.devices"
+            multiple
+            filterable
+            clearable
+            placeholder="选择设备类型"
+            style="width: 100%;"
+          >
+            <el-option
+              v-for="opt in facets.device"
+              :key="opt.value"
+              :label="`${opt.value}（${opt.count}）`"
+              :value="opt.value"
+            />
+          </el-select>
         </div>
       </aside>
 
@@ -507,4 +538,42 @@ onMounted(fetchTags)*/
 .meta { font-size: 13px; color:#9aa0a6; display:flex; gap:8px; align-items:center; }
 .card-checkbox { position: absolute; top: 10px; right: 10px; z-index: 2; background: rgba(255,255,255,0.8); border-radius: 8px; padding: 2px 4px; }
 .empty { margin-top: 8vh; }
+
+@media (max-width: 768px) {
+  .nav {
+    height: auto;
+    padding: 10px 12px;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .logo {
+    min-width: 0;
+  }
+
+  .search {
+    max-width: 100%;
+  }
+
+  .nav .right {
+    width: 100%;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  .bulk-bar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .content {
+    padding: 12px;
+  }
+
+  .grid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  }
+}
 </style>

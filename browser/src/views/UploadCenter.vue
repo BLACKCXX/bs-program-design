@@ -1,5 +1,6 @@
 <script setup>
-import { ref, reactive, computed } from 'vue'
+import { nextTick, ref, reactive, computed } from 'vue'
+import { useRouter, isNavigationFailure, NavigationFailureType } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { UploadFilled } from '@element-plus/icons-vue'
 import api from '../api/http'
@@ -7,6 +8,8 @@ import { useAiAnalyzer } from '../utils/useAiAnalyzer'
 
 const form = reactive({ title: '', description: '', tags: [] })
 const fileList = ref([])
+const uploadQueue = ref([])
+const router = useRouter()
 
 const accept = '.jpg,.jpeg,.png,.gif,.webp'
 const MAX_SIZE = 10 * 1024 * 1024
@@ -19,8 +22,37 @@ function beforeUpload(file) {
   if (file.size > MAX_SIZE) { ElMessage.error('单个文件不能超过 10MB'); return false }
   return true
 }
-const onChange = (_file, files) => (fileList.value = files)
-const onRemove = (_file, files) => (fileList.value = files)
+
+const revokePreview = (url) => { try { url && URL.revokeObjectURL(url) } catch (e) {} }
+const syncQueue = (files = []) => {
+  const existing = new Map(uploadQueue.value.map((q) => [q.uid, q]))
+  const next = files.map((f) => {
+    const prev = existing.get(f.uid)
+    const preview = prev?.preview || (f.raw ? URL.createObjectURL(f.raw) : (f.url || ''))
+    return {
+      uid: f.uid,
+      name: f.name,
+      size: f.size,
+      status: f.status || prev?.status || 'ready',
+      preview,
+      serverUrl: prev?.serverUrl || f.url || '',
+      imageId: prev?.imageId || f.imageId || null,
+      duplicated: prev?.duplicated || f.duplicated || false,
+    }
+  })
+  existing.forEach((val, key) => {
+    if (!files.find((f) => f.uid === key)) revokePreview(val.preview)
+  })
+  uploadQueue.value = next
+}
+const onChange = (_file, files) => {
+  fileList.value = files
+  syncQueue(files)
+}
+const onRemove = (_file, files) => {
+  fileList.value = files
+  syncQueue(files)
+}
 
 const uploading = ref(false)
 const USE_MOCK = false
@@ -29,6 +61,8 @@ function reset() {
   form.title = ''
   form.description = ''
   form.tags = []
+  uploadQueue.value.forEach((q) => revokePreview(q.preview))
+  uploadQueue.value = []
   fileList.value = []
 }
 
@@ -45,12 +79,44 @@ function mergeTags(newTags = []) {
 
 const { analyzing, analyze: analyzeByAI } = useAiAnalyzer({ form, fileList, mergeTags })
 
+const updateQueueWithServer = (savedList = []) => {
+  const arr = Array.isArray(savedList) ? savedList : []
+  uploadQueue.value = uploadQueue.value.map((q, idx) => {
+    const resp = arr[idx] || {}
+    const serverUrl = resp.thumb_url || resp.url || q.serverUrl || q.preview
+    if (q.preview && serverUrl && serverUrl !== q.preview) revokePreview(q.preview)
+    return {
+      ...q,
+      serverUrl,
+      status: 'success',
+      imageId: resp.image_id || resp.id || q.imageId || null,
+      duplicated: !!resp.duplicated,
+    }
+  })
+  fileList.value = fileList.value.map((f, idx) => {
+    const resp = arr[idx] || {}
+    return { ...f, status: 'success', url: resp.thumb_url || resp.url || f.url, imageId: resp.image_id || resp.id }
+  })
+  return arr
+}
+
+const safeNavigate = async (target) => {
+  try {
+    await router.push(target)
+  } catch (err) {
+    if (!isNavigationFailure(err, NavigationFailureType.duplicated)) {
+      console.error('[upload] navigation failed', err)
+    }
+  }
+}
+
 const submit = async () => {
   if (!fileList.value.length) {
     ElMessage.warning('请选择要上传的图片')
     return
   }
   uploading.value = true
+  let savedList = []
   try {
     const fd = new FormData()
     fileList.value.forEach((f) => fd.append('files', f.raw))
@@ -60,11 +126,22 @@ const submit = async () => {
 
     if (USE_MOCK) {
       await new Promise((r) => setTimeout(r, 800))
+      savedList = uploadQueue.value.map((q) => ({ url: q.serverUrl || q.preview }))
     } else {
-      await api.post('/api/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      const { data } = await api.post('/api/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      savedList = data?.saved || data?.files || []
     }
+    const applied = updateQueueWithServer(savedList)
     ElMessage.success('上传成功')
-    reset()
+    const ids = applied.map((it) => it?.image_id || it?.id).filter(Boolean)
+    const effectiveCount = Math.max(applied.length || 0, uploadQueue.value.length || 0, fileList.value.length || 0)
+    uploading.value = false
+    await nextTick()
+    if (effectiveCount === 1 && ids[0]) {
+      await safeNavigate({ name: 'ImageDetail', params: { id: ids[0] } })
+    } else {
+      await safeNavigate({ name: 'gallery', query: { from: 'upload', t: Date.now() } })
+    }
   } catch (e) {
     ElMessage.error(e?.response?.data?.error || '上传失败')
   } finally {
@@ -159,11 +236,14 @@ const submit = async () => {
 
     <div class="card queue">
       <div class="queue-title">上传队列</div>
-      <div v-if="!fileList.length" class="empty">暂时还没有待上传的图片～ 先从上面选择几张吧 💗</div>
+      <div v-if="!uploadQueue.length" class="empty">暂时还没有待上传的图片～ 先从上面选择几张吧 💗</div>
       <div v-else class="queue-list">
-        <div v-for="file in fileList" :key="file.uid" class="queue-item">
-          <div class="name">{{ file.name }}</div>
-          <div class="meta">{{ (file.size / 1024 / 1024).toFixed(1) }} MB</div>
+        <div v-for="file in uploadQueue" :key="file.uid" class="queue-item">
+          <div class="thumb" :style="file.serverUrl || file.preview ? { backgroundImage: `url(${file.serverUrl || file.preview})` } : {}"></div>
+          <div class="queue-info">
+            <div class="name">{{ file.name }}</div>
+            <div class="meta">{{ (file.size / 1024 / 1024).toFixed(1) }} MB</div>
+          </div>
         </div>
       </div>
     </div>
@@ -313,7 +393,7 @@ const submit = async () => {
 
 .queue-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 10px;
 }
 
@@ -323,11 +403,32 @@ const submit = async () => {
   border-radius: 12px;
   padding: 10px;
   box-shadow: 0 8px 18px rgba(75, 140, 255, 0.08);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.thumb {
+  width: 64px;
+  height: 64px;
+  border-radius: 10px;
+  background: #f2f4f8;
+  background-size: cover;
+  background-position: center;
+  flex-shrink: 0;
+}
+
+.queue-info {
+  flex: 1;
+  overflow: hidden;
 }
 
 .name {
   font-weight: 600;
   color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .meta {
@@ -339,6 +440,49 @@ const submit = async () => {
 @media (max-width: 960px) {
   .grid {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .upload-page {
+    gap: 12px;
+  }
+
+  .header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .card {
+    padding: 12px;
+  }
+
+  .drop-inner {
+    padding: 14px;
+  }
+
+  .drag-area {
+    padding: 22px 10px;
+  }
+
+  .msg {
+    font-size: 16px;
+  }
+
+  .actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 8px;
+  }
+
+  .actions :deep(.el-button) {
+    flex: 1 1 48%;
+    min-height: 44px;
+  }
+
+  .queue-list {
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   }
 }
 </style>
