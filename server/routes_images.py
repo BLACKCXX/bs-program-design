@@ -1107,15 +1107,20 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
             return val.strip().lower() in ("1", "true", "yes", "y", "on")
         return False
 
+    # 缩放使用 LANCZOS 重采样，保证像素级缩放质量
     resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 
-    # 1) 旋转（像素级旋转，白底填充）
+    # 1) 旋转（像素级旋转，使用工作台底色避免黑边）
     deg_f = _to_float(params.get("rotate")) or 0
     if deg_f % 360 != 0:
+        fill_rgb = (245, 247, 250)
         try:
-            img = img.rotate(-deg_f, expand=True, fillcolor="white")
+            img = img.rotate(-deg_f, expand=True, fillcolor=fill_rgb)
         except TypeError:
-            img = img.rotate(-deg_f, expand=True)
+            rotated = img.convert("RGBA").rotate(-deg_f, expand=True)
+            background = Image.new("RGBA", rotated.size, fill_rgb + (255,))
+            background.paste(rotated, (0, 0), rotated)
+            img = background.convert("RGB")
 
     # 2) 裁剪（基于旋转后的像素）
     crop_rect = params.get("crop_rect")
@@ -1173,7 +1178,7 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
         percent = int(100 + scale * 300)
         img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=3))
 
-    # 4) 缩放：明确模式，默认避免 pad 造成“白底变了图不变”的误解
+    # 4) 缩放：等比缩放 + 必要时 padding，避免裁切内容
     tw = _to_int(params.get("target_width"))
     th = _to_int(params.get("target_height"))
     keep_ratio = _to_bool(params.get("keep_ratio"))
@@ -1214,13 +1219,13 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
         if tw and th:
             try:
                 if not resize_mode:
-                    resize_mode = "fit" if keep_ratio else "stretch"
-                if resize_mode not in ("stretch", "fit", "pad"):
-                    resize_mode = "fit" if keep_ratio else "stretch"
+                    resize_mode = "pad" if keep_ratio else "stretch"
+                if resize_mode in ("fit", "contain"):
+                    resize_mode = "pad" if keep_ratio else "stretch"
+                if resize_mode not in ("stretch", "pad"):
+                    resize_mode = "pad" if keep_ratio else "stretch"
                 if resize_mode == "pad":
                     img = ImageOps.pad(img, (tw, th), method=resample, color="white")
-                elif resize_mode == "fit":
-                    img = ImageOps.fit(img, (tw, th), method=resample, centering=(0.5, 0.5))
                 else:
                     img = img.resize((tw, th), resample=resample)
             except Exception:

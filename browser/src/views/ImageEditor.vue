@@ -18,15 +18,17 @@ const emptyImage = {
 }
 
 const image = ref({ ...emptyImage })
-const baseSrc = ref('')
-const workingPreviewUrl = ref('')
-const previewKey = computed(() => `${workingPreviewUrl.value || 'empty'}`)
+const workingImageId = ref(null)
+const workingUrl = ref('')
+const previewUrl = ref('')
+const previewKey = computed(() => `${previewUrl.value || 'empty'}`)
 const loading = ref(false)
 const previewLoading = ref(false)
 const ready = ref(false)
 const loadError = ref('')
 const blobUrl = ref('')
 const previewObjectUrl = ref('')
+const checkpointUrl = ref('')
 
 const zoom = ref(100)
 const changeZoom = (delta) => {
@@ -43,6 +45,11 @@ const normalizeFilePath = (p = '') => {
   return `/files/${encodeURI(clean)}`
 }
 
+const buildVersionedUrl = (rawUrl, stamp = Date.now()) => {
+  if (!rawUrl) return ''
+  return `${normalizeFilePath(rawUrl)}?v=${stamp}`
+}
+
 const pickUrl = (data = {}) =>
   data.url ||
   data.cover_url ||
@@ -57,9 +64,9 @@ const fetchPreviewBlob = async (url, asBase = false) => {
     const resp = await api.get(url, { responseType: 'blob' })
     if (blobUrl.value) URL.revokeObjectURL(blobUrl.value)
     blobUrl.value = URL.createObjectURL(resp.data)
-    workingPreviewUrl.value = blobUrl.value
+    previewUrl.value = blobUrl.value
     if (asBase) {
-      baseSrc.value = blobUrl.value
+      workingUrl.value = blobUrl.value
     }
   } catch (err) {
     console.error('[editor] blob fetch failed', url, err)
@@ -71,9 +78,18 @@ const onImgError = async (e) => {
   const badUrl = e?.target?.src
   console.error('[editor] load error', badUrl)
   if (badUrl && badUrl.startsWith('blob:')) return
-  if (image.value.url) {
-    await fetchPreviewBlob(image.value.url, true)
+  const fallbackUrl = workingUrl.value || image.value.url
+  if (fallbackUrl) {
+    await fetchPreviewBlob(fallbackUrl, true)
   }
+}
+
+const getFromQuery = () => (typeof route.query.from === 'string' ? route.query.from : '')
+const buildDetailQuery = (stamp = Date.now()) => {
+  const query = { t: stamp }
+  const from = getFromQuery()
+  if (from) query.from = from
+  return query
 }
 
 const loadDetail = async () => {
@@ -81,7 +97,9 @@ const loadDetail = async () => {
     loading.value = true
     ready.value = false
     loadError.value = ''
-    workingPreviewUrl.value = ''
+    previewUrl.value = ''
+    previewSeq += 1
+    endScaleDrag()
     const { data } = await api.get(`/api/images/${route.params.id}`)
     const picked = pickUrl(data)
     const stamp =
@@ -97,8 +115,10 @@ const loadDetail = async () => {
       ...data,
       url: absUrl,
     }
-    baseSrc.value = absUrl
-    workingPreviewUrl.value = absUrl
+    workingImageId.value = data?.id || route.params.id
+    workingUrl.value = absUrl
+    previewUrl.value = absUrl
+    checkpointUrl.value = absUrl
     if (blobUrl.value) {
       URL.revokeObjectURL(blobUrl.value)
       blobUrl.value = ''
@@ -108,15 +128,12 @@ const loadDetail = async () => {
       previewObjectUrl.value = ''
     }
     imgNatural.value = { w: 0, h: 0 }
-    pendingCrop.value = null
+    cropRect.value = { x: 0, y: 0, width: 0, height: 0 }
     isCropping.value = false
-    targetWidth.value = null
-    targetHeight.value = null
-    cropAspect.value = 'free'
-    customCropW.value = 1
-    customCropH.value = 1
+    isScaling.value = false
+    scaleRect.value = { width: 0, height: 0 }
+    scaleBase.value = { w: 0, h: 0 }
     zoom.value = 100
-    rotate.value = 0
     brightness.value = 0
     contrast.value = 0
     saturation.value = 0
@@ -134,17 +151,9 @@ const loadDetail = async () => {
 
 // ---- 编辑状态 ----
 const isCropping = ref(false)
-const cropAspect = ref('free')
-const customCropW = ref(1)
-const customCropH = ref(1)
 const cropRect = ref({ x: 0, y: 0, width: 0, height: 0 })
-const pendingCrop = ref(null)
 const dragState = ref(null)
 const history = ref([])
-
-const ROTATE_MIN = -180
-const ROTATE_MAX = 180
-const rotate = ref(0)
 
 const brightness = ref(0)
 const contrast = ref(0)
@@ -152,9 +161,13 @@ const saturation = ref(0)
 const warmth = ref(0)
 const sharpen = ref(0)
 
-const lockRatio = ref(true)
-const targetWidth = ref(null)
-const targetHeight = ref(null)
+const MIN_SCALE_PX = 16
+const MAX_SCALE_PX = 8192
+
+const isScaling = ref(false)
+const scaleRect = ref({ width: 0, height: 0 })
+const scaleBase = ref({ w: 0, h: 0 })
+const scaleDragState = ref(null)
 
 const imgEl = ref(null)
 const imgNatural = ref({ w: 0, h: 0 })
@@ -180,17 +193,31 @@ const fitScale = computed(() => {
   return Math.min(w / bw, h / bh) * 0.98
 })
 const renderScale = computed(() => fitScale.value * (zoom.value / 100))
+const scaleRatioX = computed(() => {
+  if (!isScaling.value) return 1
+  const baseW = scaleBase.value.w
+  if (!baseW) return 1
+  return scaleRect.value.width / baseW
+})
+const scaleRatioY = computed(() => {
+  if (!isScaling.value) return 1
+  const baseH = scaleBase.value.h
+  if (!baseH) return 1
+  return scaleRect.value.height / baseH
+})
+const displayScaleX = computed(() => renderScale.value * scaleRatioX.value)
+const displayScaleY = computed(() => renderScale.value * scaleRatioY.value)
 const holderStyle = computed(() => {
   if (!bboxSize.value.w || !bboxSize.value.h) return {}
   return {
-    width: `${bboxSize.value.w * renderScale.value}px`,
-    height: `${bboxSize.value.h * renderScale.value}px`,
+    width: `${bboxSize.value.w * displayScaleX.value}px`,
+    height: `${bboxSize.value.h * displayScaleY.value}px`,
   }
 })
 const imgStyle = computed(() => ({
   width: imgNatural.value.w ? `${imgNatural.value.w}px` : undefined,
   height: imgNatural.value.h ? `${imgNatural.value.h}px` : undefined,
-  transform: `translate(-50%, -50%) scale(${renderScale.value})`,
+  transform: `translate(-50%, -50%) scale(${displayScaleX.value}, ${displayScaleY.value})`,
   transformOrigin: 'center center',
 }))
 
@@ -211,6 +238,16 @@ const getWorkingNatural = () => {
   return { w: image.value.width || 0, h: image.value.height || 0 }
 }
 
+const initCropRect = () => {
+  const natural = getWorkingNatural()
+  if (!natural.w || !natural.h) return
+  const width = natural.w * 0.6
+  const height = natural.h * 0.6
+  const x = (natural.w - width) / 2
+  const y = (natural.h - height) / 2
+  cropRect.value = { x, y, width, height }
+}
+
 const onEditorImgLoad = async (e) => {
   const el = e.target
   imgNatural.value = { w: el.naturalWidth, h: el.naturalHeight }
@@ -219,12 +256,7 @@ const onEditorImgLoad = async (e) => {
   syncImgBox()
 }
 
-watch(zoom, async () => {
-  await nextTick()
-  syncImgBox()
-})
-
-watch(isCropping, async () => {
+watch([zoom, isCropping, isScaling], async () => {
   await nextTick()
   syncImgBox()
 })
@@ -245,6 +277,7 @@ watch(
 )
 
 onUnmounted(() => {
+  endScaleDrag()
   if (stageObserver) {
     stageObserver.disconnect()
     stageObserver = null
@@ -280,72 +313,51 @@ const clearPreviewObjectUrl = () => {
 
 const resetPreviewToBase = () => {
   clearPreviewObjectUrl()
-  if (baseSrc.value) {
-    workingPreviewUrl.value = baseSrc.value
+  if (workingUrl.value) {
+    previewUrl.value = workingUrl.value
   }
 }
 
-const parseAspectValue = (val) => {
-  if (!val || val === 'free') return { w: null, h: null }
-  const parts = String(val).split(':')
-  if (parts.length !== 2) return { w: null, h: null }
-  const w = Number(parts[0]) || null
-  const h = Number(parts[1]) || null
-  return w && h ? { w, h } : { w: null, h: null }
+// 进入裁剪/缩放模式时保存当前工作图，取消时可回滚
+const saveCheckpoint = () => {
+  checkpointUrl.value = workingUrl.value
+}
+const restoreCheckpoint = () => {
+  if (checkpointUrl.value && checkpointUrl.value !== workingUrl.value) {
+    workingUrl.value = checkpointUrl.value
+    previewUrl.value = checkpointUrl.value
+    clearPreviewObjectUrl()
+  }
 }
 
-const buildPreviewPayload = (options = {}) => {
-  const payload = {
-    rotate: rotate.value,
-    brightness: brightness.value,
-    contrast: contrast.value,
-    saturation: saturation.value,
-    warmth: warmth.value,
-    sharpen: sharpen.value,
-    crop_rect: pendingCrop.value ? { ...pendingCrop.value } : null,
-    target_width: targetWidth.value,
-    target_height: targetHeight.value,
-    keep_ratio: lockRatio.value,
-    resize_mode: 'stretch',
-  }
-  if (options.skipCrop) {
-    payload.crop_rect = null
-  }
-  if (options.skipResize) {
-    payload.target_width = null
-    payload.target_height = null
-  }
-  return payload
-}
+const buildPreviewPayload = () => ({
+  brightness: brightness.value,
+  contrast: contrast.value,
+  saturation: saturation.value,
+  warmth: warmth.value,
+  sharpen: sharpen.value,
+})
 
 const hasPreviewEdits = (payload) => {
-  const rotateVal = Number(payload.rotate) || 0
   const hasAdjust =
     Number(payload.brightness) ||
     Number(payload.contrast) ||
     Number(payload.saturation) ||
     Number(payload.warmth) ||
     Number(payload.sharpen)
-  return (
-    rotateVal % 360 !== 0 ||
-    hasAdjust ||
-    !!payload.crop_rect ||
-    !!payload.target_width ||
-    !!payload.target_height
-  )
+  return !!hasAdjust
 }
 
-const schedulePreview = (options = {}) => {
+const schedulePreview = () => {
   if (!ready.value) return
   if (previewTimer) clearTimeout(previewTimer)
-  previewTimer = setTimeout(() => refreshPreview(options), 260)
+  previewTimer = setTimeout(() => refreshPreview(), 260)
 }
 
-const refreshPreview = async (options = {}) => {
-  if (!ready.value || !image.value.id) return
-  const skipCrop = options.skipCrop ?? isCropping.value
-  const skipResize = options.skipResize ?? isCropping.value
-  const payload = buildPreviewPayload({ skipCrop, skipResize })
+const refreshPreview = async () => {
+  const targetId = workingImageId.value || image.value.id || route.params.id
+  if (!ready.value || !targetId) return
+  const payload = buildPreviewPayload()
   if (!hasPreviewEdits(payload)) {
     resetPreviewToBase()
     return
@@ -353,11 +365,11 @@ const refreshPreview = async (options = {}) => {
   previewLoading.value = true
   const seq = ++previewSeq
   try {
-    const { data } = await api.post(`/api/images/${image.value.id}/preview`, payload, { responseType: 'blob' })
+    const { data } = await api.post(`/api/images/${targetId}/preview`, payload, { responseType: 'blob' })
     if (seq !== previewSeq) return
     clearPreviewObjectUrl()
     previewObjectUrl.value = URL.createObjectURL(data)
-    workingPreviewUrl.value = previewObjectUrl.value
+    previewUrl.value = previewObjectUrl.value
   } catch (err) {
     console.error('[editor] preview failed', err)
     ElMessage.error(err?.response?.data?.error || '预览生成失败')
@@ -368,82 +380,83 @@ const refreshPreview = async (options = {}) => {
   }
 }
 
-watch([rotate, brightness, contrast, saturation, warmth, sharpen], () => {
+const applyEditAndSync = async (payload) => {
+  const targetId = workingImageId.value || image.value.id || route.params.id
+  const { data } = await api.post(`/api/images/${targetId}/edit`, payload)
+  const nextId = data?.image_id || targetId
+  const stamp = data?.updatedAt ? new Date(data.updatedAt).getTime() || Date.now() : Date.now()
+  const nextUrl = data?.url ? buildVersionedUrl(data.url, stamp) : workingUrl.value
+
+  workingImageId.value = nextId
+  image.value.id = nextId
+  if (nextUrl) {
+    workingUrl.value = nextUrl
+    previewUrl.value = nextUrl
+    image.value.url = nextUrl
+  }
+  checkpointUrl.value = workingUrl.value
+  previewSeq += 1
+  clearPreviewObjectUrl()
+  imgNatural.value = { w: 0, h: 0 }
+  await nextTick()
+  updateStageSize()
+  syncImgBox()
+  return { nextId, stamp, nextUrl, mode: data?.mode }
+}
+
+watch([brightness, contrast, saturation, warmth, sharpen], () => {
   if (!ready.value) return
   schedulePreview()
 })
 
 const captureSnapshot = () => {
   history.value.push({
-    cropAspect: cropAspect.value,
-    customCropW: customCropW.value,
-    customCropH: customCropH.value,
-    rotate: rotate.value,
     brightness: brightness.value,
     contrast: contrast.value,
     saturation: saturation.value,
     warmth: warmth.value,
     sharpen: sharpen.value,
-    pendingCrop: pendingCrop.value ? { ...pendingCrop.value } : null,
     cropRect: cropRect.value ? { ...cropRect.value } : null,
-    lockRatio: lockRatio.value,
-    targetWidth: targetWidth.value,
-    targetHeight: targetHeight.value,
+    isScaling: isScaling.value,
+    scaleRect: scaleRect.value ? { ...scaleRect.value } : null,
+    scaleBase: scaleBase.value ? { ...scaleBase.value } : null,
   })
 }
 
 const undo = () => {
   const prev = history.value.pop()
   if (!prev) return
-  cropAspect.value = prev.cropAspect
-  customCropW.value = prev.customCropW
-  customCropH.value = prev.customCropH
-  rotate.value = prev.rotate
   brightness.value = prev.brightness
   contrast.value = prev.contrast
   saturation.value = prev.saturation
   warmth.value = prev.warmth
   sharpen.value = prev.sharpen
-  pendingCrop.value = prev.pendingCrop ? { ...prev.pendingCrop } : null
   cropRect.value = prev.cropRect ? { ...prev.cropRect } : { ...cropRect.value }
-  lockRatio.value = prev.lockRatio
-  targetWidth.value = prev.targetWidth
-  targetHeight.value = prev.targetHeight
+  isScaling.value = prev.isScaling ?? false
+  scaleRect.value = prev.scaleRect ? { ...prev.scaleRect } : { ...scaleRect.value }
+  scaleBase.value = prev.scaleBase ? { ...prev.scaleBase } : { ...scaleBase.value }
   isCropping.value = false
   refreshPreview()
 }
 
-const toggleCropMode = async () => {
+const toggleCropMode = () => {
   if (!isCropping.value) {
+    saveCheckpoint()
+    isScaling.value = false
     isCropping.value = true
-    if (pendingCrop.value) {
-      cropRect.value = { ...pendingCrop.value }
-    } else {
-      cropRect.value = { x: 0, y: 0, width: 0, height: 0 }
-    }
-    await refreshPreview({ skipCrop: true, skipResize: true })
+    cropRect.value = { x: 0, y: 0, width: 0, height: 0 }
     if (!cropRect.value?.width || !cropRect.value?.height) {
       initCropRect()
     }
     return
   }
   isCropping.value = false
-  await refreshPreview()
 }
 
-const cancelCrop = async () => {
+const cancelCrop = () => {
   isCropping.value = false
-  if (pendingCrop.value) {
-    cropRect.value = { ...pendingCrop.value }
-  } else {
-    initCropRect()
-  }
-  await refreshPreview()
-}
-
-const getCropRatio = () => {
-  const ratio = parseAspectValue(cropAspect.value)
-  return ratio.w && ratio.h ? ratio.w / ratio.h : null
+  initCropRect()
+  restoreCheckpoint()
 }
 
 const clampCropRect = (rect, natural) => {
@@ -456,87 +469,175 @@ const clampCropRect = (rect, natural) => {
   return { x, y, width, height }
 }
 
-const applyAspectToRect = (rect, ratio) => {
-  if (!rect || !ratio) return rect
+const mapCropToBase = (rect) => {
+  if (!rect) return rect
   const natural = getWorkingNatural()
-  let width = rect.width
-  let height = rect.height
-  const centerX = rect.x + width / 2
-  const centerY = rect.y + height / 2
-  if (width / height > ratio) {
-    width = height * ratio
-  } else {
-    height = width / ratio
-  }
-  const x = centerX - width / 2
-  const y = centerY - height / 2
-  return clampCropRect({ x, y, width, height }, natural)
+  return clampCropRect({ ...rect }, natural)
 }
 
-const setCropAspect = (val) => {
-  captureSnapshot()
-  cropAspect.value = val
-  const ratio = getCropRatio()
-  if (isCropping.value && ratio && cropRect.value?.width && cropRect.value?.height) {
-    cropRect.value = applyAspectToRect(cropRect.value, ratio)
+const rotateLoading = ref(false)
+const applyRotate = async (delta) => {
+  if (rotateLoading.value) return
+  if (isCropping.value || isScaling.value) {
+    ElMessage.warning('请先应用或取消当前操作')
+    return
   }
-}
-const setCustomCropAspect = () => {
-  if (customCropW.value > 0 && customCropH.value > 0) {
-    setCropAspect(`${customCropW.value}:${customCropH.value}`)
+  rotateLoading.value = true
+  try {
+    // 旋转为像素级更新，避免后续操作回到原图
+    await applyEditAndSync({ mode: 'override', rotate: delta })
+    ElMessage.success(delta > 0 ? '已顺时针旋转90°' : '已逆时针旋转90°')
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '旋转失败')
+  } finally {
+    rotateLoading.value = false
   }
 }
 
-const rotateStep = (delta) => {
-  captureSnapshot()
-  let next = rotate.value + delta
-  if (next > ROTATE_MAX) next -= 360
-  if (next < ROTATE_MIN) next += 360
-  rotate.value = next
-}
-const rotateSliderChange = (val) => {
-  captureSnapshot()
-  rotate.value = val
-}
-
-const resetAdjust = () => {
+const resetAdjust = async () => {
   captureSnapshot()
   brightness.value = 0
   contrast.value = 0
   saturation.value = 0
   warmth.value = 0
   sharpen.value = 0
-  schedulePreview()
+  isCropping.value = false
+  isScaling.value = false
+  scaleRect.value = { width: 0, height: 0 }
+  scaleBase.value = { w: 0, h: 0 }
+  initCropRect()
+  await refreshPreview()
 }
 
-const applySize = async () => {
-  captureSnapshot()
-  const base = getWorkingNatural()
+const scaleLoading = ref(false)
+const startScaleMode = async () => {
+  if (isScaling.value) return
+  const natural = getWorkingNatural()
+  if (!natural.w || !natural.h) {
+    ElMessage.warning('无法获取图片尺寸')
+    return
+  }
+  saveCheckpoint()
+  isCropping.value = false
+  scaleBase.value = { w: natural.w, h: natural.h }
+  scaleRect.value = { width: natural.w, height: natural.h }
+  isScaling.value = true
+  await nextTick()
+  syncImgBox()
+}
+
+const cancelScale = async () => {
+  if (!isScaling.value) return
+  isScaling.value = false
+  scaleRect.value = { width: scaleBase.value.w, height: scaleBase.value.h }
+  await nextTick()
+  syncImgBox()
+  restoreCheckpoint()
+}
+
+const applyScale = async () => {
+  if (!isScaling.value) {
+    ElMessage.warning('请先进入缩放模式')
+    return
+  }
+  if (scaleLoading.value) return
+  const base = scaleBase.value
   if (!base.w || !base.h) {
     ElMessage.warning('无法获取图片尺寸')
     return
   }
+  const tw = Math.round(scaleRect.value.width || base.w)
+  const th = Math.round(scaleRect.value.height || base.h)
+  const clamp = (val) => Math.min(MAX_SCALE_PX, Math.max(MIN_SCALE_PX, Math.round(val)))
+  const targetW = clamp(tw)
+  const targetH = clamp(th)
 
-  let tw = targetWidth.value ? Number(targetWidth.value) : null
-  let th = targetHeight.value ? Number(targetHeight.value) : null
-  if (!tw && !th) {
-    ElMessage.warning('请输入目标尺寸')
+  if (targetW === base.w && targetH === base.h) {
+    isScaling.value = false
     return
   }
 
-  if (lockRatio.value) {
-    if (tw && !th) th = Math.round((tw / base.w) * base.h)
-    if (th && !tw) tw = Math.round((th / base.h) * base.w)
-    if (tw && th) th = Math.round((tw / base.w) * base.h)
-  } else {
-    if (tw && !th) th = base.h
-    if (th && !tw) tw = base.w
+  scaleLoading.value = true
+  try {
+    captureSnapshot()
+    const payload = {
+      mode: 'override',
+      // 后端 Pillow 使用 LANCZOS 重采样，确保像素级缩放（stretch）
+      target_width: targetW,
+      target_height: targetH,
+      keep_ratio: false,
+      resize_mode: 'stretch',
+    }
+    await applyEditAndSync(payload)
+    image.value.width = targetW
+    image.value.height = targetH
+    isScaling.value = false
+    scaleBase.value = { w: targetW, h: targetH }
+    scaleRect.value = { width: targetW, height: targetH }
+    await refreshPreview()
+    ElMessage.success('已应用缩放')
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '缩放失败')
+  } finally {
+    scaleLoading.value = false
+  }
+}
+
+function startScaleDrag(evt, handle) {
+  if (!isScaling.value || !scaleBase.value.w || !scaleBase.value.h) return
+  scaleDragState.value = {
+    handle,
+    startX: evt.clientX,
+    startY: evt.clientY,
+    startW: scaleRect.value.width || scaleBase.value.w,
+    startH: scaleRect.value.height || scaleBase.value.h,
+  }
+  window.addEventListener('mousemove', onScaleDrag)
+  window.addEventListener('mouseup', endScaleDrag)
+}
+
+function onScaleDrag(evt) {
+  const st = scaleDragState.value
+  if (!st) return
+  const base = scaleBase.value
+  if (!base.w || !base.h || !renderScale.value) return
+  const dx = (evt.clientX - st.startX) / renderScale.value
+  const dy = (evt.clientY - st.startY) / renderScale.value
+  let nextW = st.startW
+  let nextH = st.startH
+
+  const hasX = st.handle.includes('e') || st.handle.includes('w')
+  const hasY = st.handle.includes('n') || st.handle.includes('s')
+  if (hasX) {
+    if (st.handle.includes('e')) nextW = st.startW + dx
+    if (st.handle.includes('w')) nextW = st.startW - dx
+  }
+  if (hasY) {
+    if (st.handle.includes('s')) nextH = st.startH + dy
+    if (st.handle.includes('n')) nextH = st.startH - dy
+  }
+  if (hasX && hasY) {
+    // 四角：保持比例缩放
+    const aspect = st.startW / st.startH || 1
+    const deltaW = nextW - st.startW
+    const deltaH = nextH - st.startH
+    if (Math.abs(deltaW) >= Math.abs(deltaH)) {
+      nextH = nextW / aspect
+    } else {
+      nextW = nextH * aspect
+    }
   }
 
-  targetWidth.value = tw
-  targetHeight.value = th
-  await refreshPreview()
-  ElMessage.success('尺寸已应用')
+  const clamp = (val) => Math.min(MAX_SCALE_PX, Math.max(MIN_SCALE_PX, val))
+  nextW = clamp(nextW)
+  nextH = clamp(nextH)
+  scaleRect.value = { width: Math.round(nextW), height: Math.round(nextH) }
+}
+
+function endScaleDrag() {
+  window.removeEventListener('mousemove', onScaleDrag)
+  window.removeEventListener('mouseup', endScaleDrag)
+  scaleDragState.value = null
 }
 
 const cropLoading = ref(false)
@@ -546,13 +647,27 @@ const applyCrop = async () => {
     return
   }
   if (cropLoading.value) return
+  const rect = mapCropToBase(cropRect.value)
+  if (!rect?.width || !rect?.height) {
+    ElMessage.warning('请先调整裁剪框大小')
+    return
+  }
   cropLoading.value = true
   try {
     captureSnapshot()
-    pendingCrop.value = { ...cropRect.value }
+    const payload = {
+      mode: 'override',
+      crop_rect: rect,
+    }
+    await applyEditAndSync(payload)
+    image.value.width = Math.round(rect.width)
+    image.value.height = Math.round(rect.height)
     isCropping.value = false
+    initCropRect()
     await refreshPreview()
     ElMessage.success('已应用裁剪')
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '裁剪失败')
   } finally {
     cropLoading.value = false
   }
@@ -572,6 +687,14 @@ const buildRectStyle = (rect) => {
 }
 
 const cropRectStyle = computed(() => buildRectStyle(cropRect.value))
+const scaleInfo = computed(() => {
+  const baseW = scaleBase.value.w || imgNatural.value.w || image.value.width || 0
+  const baseH = scaleBase.value.h || imgNatural.value.h || image.value.height || 0
+  const w = Math.round(scaleRect.value.width || baseW)
+  const h = Math.round(scaleRect.value.height || baseH)
+  if (!w || !h) return ''
+  return `${w} × ${h}`
+})
 
 const startDrag = (evt, mode) => {
   if (!isCropping.value || !imgBox.value.w) return
@@ -631,36 +754,35 @@ const onExport = async () => {
     ElMessage.warning('请先输入导出名称')
     return
   }
-  const cropPayload = pendingCrop.value ? { ...pendingCrop.value } : (isCropping.value ? { ...cropRect.value } : null)
+  const cropPayload = isCropping.value ? mapCropToBase(cropRect.value) : null
   const payload = {
     mode: exportMode.value,
     exportName: exportName.value || image.value.title,
-    rotate: rotate.value,
-    crop_ratio: cropAspect.value,
     brightness: brightness.value,
     contrast: contrast.value,
     saturation: saturation.value,
     warmth: warmth.value,
     sharpen: sharpen.value,
     crop_rect: cropPayload,
-    target_width: targetWidth.value,
-    target_height: targetHeight.value,
-    keep_ratio: lockRatio.value,
-    resize_mode: 'stretch',
   }
   try {
-    const { data } = await api.post(`/api/images/${image.value.id || route.params.id}/edit`, payload)
-    const targetId = data?.image_id || image.value.id || route.params.id
+    const targetId = workingImageId.value || image.value.id || route.params.id
+    const { data } = await api.post(`/api/images/${targetId}/edit`, payload)
+    const nextId = data?.image_id || targetId
     const stamp = data?.updatedAt ? new Date(data.updatedAt).getTime() || Date.now() : Date.now()
     ElMessage.success('导出成功')
-    router.push({ name: 'ImageDetail', params: { id: targetId }, query: { t: stamp } })
+    router.push({ name: 'ImageDetail', params: { id: nextId }, query: buildDetailQuery(stamp) })
   } catch (err) {
     ElMessage.error(err?.response?.data?.error || '导出失败')
   }
 }
 
 const goBack = () => {
-  router.push({ name: 'ImageDetail', params: { id: route.params.id } })
+  router.push({
+    name: 'ImageDetail',
+    params: { id: workingImageId.value || route.params.id },
+    query: buildDetailQuery(),
+  })
 }
 </script>
 
@@ -687,11 +809,11 @@ const goBack = () => {
             <div class="stage-body">
               <el-skeleton v-if="loading" :rows="6" animated style="width:100%;height:360px;" />
               <div v-else ref="stageRef" class="stage-area">
-                <div v-if="workingPreviewUrl && !loadError" class="img-holder" :style="holderStyle">
+                <div v-if="previewUrl && !loadError" class="img-holder" :style="holderStyle">
                   <img
                     ref="imgEl"
                     :key="previewKey"
-                    :src="workingPreviewUrl"
+                    :src="previewUrl"
                     :alt="image.title"
                     :style="imgStyle"
                     @load="onEditorImgLoad"
@@ -704,6 +826,18 @@ const goBack = () => {
                       <span class="handle handle-ne" @mousedown.stop.prevent="startDrag($event, 'ne')"></span>
                       <span class="handle handle-sw" @mousedown.stop.prevent="startDrag($event, 'sw')"></span>
                       <span class="handle handle-se" @mousedown.stop.prevent="startDrag($event, 'se')"></span>
+                    </div>
+                  </div>
+                  <div v-if="isScaling" class="scale-overlay">
+                    <div class="scale-rect">
+                      <span class="handle handle-nw" @mousedown.stop.prevent="startScaleDrag($event, 'nw')"></span>
+                      <span class="handle handle-ne" @mousedown.stop.prevent="startScaleDrag($event, 'ne')"></span>
+                      <span class="handle handle-sw" @mousedown.stop.prevent="startScaleDrag($event, 'sw')"></span>
+                      <span class="handle handle-se" @mousedown.stop.prevent="startScaleDrag($event, 'se')"></span>
+                      <span class="handle handle-n" @mousedown.stop.prevent="startScaleDrag($event, 'n')"></span>
+                      <span class="handle handle-s" @mousedown.stop.prevent="startScaleDrag($event, 's')"></span>
+                      <span class="handle handle-e" @mousedown.stop.prevent="startScaleDrag($event, 'e')"></span>
+                      <span class="handle handle-w" @mousedown.stop.prevent="startScaleDrag($event, 'w')"></span>
                     </div>
                   </div>
                 </div>
@@ -725,44 +859,23 @@ const goBack = () => {
               <el-button size="small" type="primary" @click="applyCrop" :disabled="!isCropping" :loading="cropLoading">应用裁剪</el-button>
               <el-button size="small" @click="cancelCrop" :disabled="!isCropping">取消裁剪</el-button>
             </div>
-            <div class="ratio-row">
-              <el-button-group>
-                <el-button :type="cropAspect === 'free' ? 'primary' : 'default'" @click="setCropAspect('free')">自由</el-button>
-                <el-button :type="cropAspect === '1:2' ? 'primary' : 'default'" @click="setCropAspect('1:2')">1:2</el-button>
-                <el-button :type="cropAspect === '3:4' ? 'primary' : 'default'" @click="setCropAspect('3:4')">3:4</el-button>
-                <el-button :type="cropAspect === '2:1' ? 'primary' : 'default'" @click="setCropAspect('2:1')">2:1</el-button>
-                <el-button :type="cropAspect === '1:1' ? 'primary' : 'default'" @click="setCropAspect('1:1')">1:1</el-button>
-                <el-button :type="cropAspect === '4:3' ? 'primary' : 'default'" @click="setCropAspect('4:3')">4:3</el-button>
-                <el-button :type="cropAspect === '16:9' ? 'primary' : 'default'" @click="setCropAspect('16:9')">16:9</el-button>
-              </el-button-group>
-              <div class="custom-ratio">
-                <span class="custom-label">自定义：</span>
-                <el-input-number v-model="customCropW" size="small" :min="1" @change="setCustomCropAspect" controls-position="right" />
-                <span class="colon">:</span>
-                <el-input-number v-model="customCropH" size="small" :min="1" @change="setCustomCropAspect" controls-position="right" />
-              </div>
-            </div>
           </div>
 
           <div class="panel neutral">
-            <div class="panel-title">照片尺寸</div>
-            <div class="ratio-row">
-              <el-input-number v-model="targetWidth" :min="1" size="small" placeholder="宽(px)" />
-              <el-input-number v-model="targetHeight" :min="1" size="small" placeholder="高(px)" />
-              <el-checkbox v-model="lockRatio">锁定比例</el-checkbox>
-              <el-button size="small" type="primary" @click="applySize">应用尺寸</el-button>
+            <div class="panel-title">缩放</div>
+            <div class="ratio-row scale-actions">
+              <el-button size="small" :type="isScaling ? 'primary' : 'default'" :disabled="isScaling" @click="startScaleMode">缩放</el-button>
+              <el-button size="small" type="primary" :loading="scaleLoading" :disabled="!isScaling" @click="applyScale">应用缩放</el-button>
+              <el-button size="small" :disabled="!isScaling" @click="cancelScale">取消缩放</el-button>
             </div>
+            <div v-if="isScaling && scaleInfo" class="scale-info">目标尺寸：{{ scaleInfo }} px</div>
           </div>
 
           <div class="panel neutral">
             <div class="panel-title">旋转</div>
             <div class="rotate-row">
-              <el-button size="small" @click="rotateStep(-90)">-90°</el-button>
-              <el-button size="small" @click="rotateStep(90)">+90°</el-button>
-              <span class="rotate-text">角度：{{ rotate }}°</span>
-            </div>
-            <div class="rotate-slider">
-              <el-slider v-model="rotate" :min="ROTATE_MIN" :max="ROTATE_MAX" :step="1" @change="rotateSliderChange" />
+              <el-button size="small" :loading="rotateLoading" @click="applyRotate(-90)">-90°</el-button>
+              <el-button size="small" :loading="rotateLoading" @click="applyRotate(90)">+90°</el-button>
             </div>
           </div>
 
@@ -941,7 +1054,8 @@ const goBack = () => {
   box-sizing: border-box;
   pointer-events: auto;
 }
-.crop-rect .handle {
+.crop-rect .handle,
+.scale-rect .handle {
   position: absolute;
   width: 12px;
   height: 12px;
@@ -950,10 +1064,27 @@ const goBack = () => {
   border-radius: 50%;
   pointer-events: auto;
 }
+.scale-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.scale-rect {
+  position: absolute;
+  inset: 0;
+  border: 2px dashed #1f6feb;
+  border-radius: 4px;
+  box-sizing: border-box;
+  pointer-events: auto;
+}
 .handle-nw { top: -6px; left: -6px; cursor: nwse-resize; }
 .handle-ne { top: -6px; right: -6px; cursor: nesw-resize; }
 .handle-sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
 .handle-se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+.handle-n { top: -6px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.handle-s { bottom: -6px; left: 50%; transform: translateX(-50%); cursor: ns-resize; }
+.handle-e { right: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
+.handle-w { left: -6px; top: 50%; transform: translateY(-50%); cursor: ew-resize; }
 
 .editor-right {
   min-width: 0;
@@ -1008,12 +1139,6 @@ const goBack = () => {
   gap: 8px;
   flex-wrap: wrap;
 }
-.rotate-text {
-  color: #1f6feb;
-}
-.rotate-slider {
-  margin-top: 8px;
-}
 .slider-row {
   display: flex;
   align-items: center;
@@ -1023,6 +1148,11 @@ const goBack = () => {
 .slider-row span {
   width: 60px;
   color: #1f6feb;
+}
+.scale-info {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 12px;
 }
 .reset-row {
   justify-content: flex-end;

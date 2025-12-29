@@ -10,6 +10,7 @@ import UploadDialog from '../components/UploadDialog.vue'
 import DateRangeInput from '../components/DateRangeInput.vue'
 import { ElMessage } from 'element-plus'
 import { Search, Upload, Download, Delete, PriceTag } from '@element-plus/icons-vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import api from '../api/http' // 预留：将来可从 /api/tags 获取真实标签
 import { toDisplayUrl } from '../utils/url'
@@ -157,14 +158,17 @@ const displayItems = computed(() => {
   return arr
 })
 
-import { useRouter } from 'vue-router'
+const route = useRoute()
 const router = useRouter()
 const onLogout = () => {
   store.logout()
   router.replace('/auth')
 }
 // 新增：点击卡片跳转到详情页（先走本地路由，后续可接真实数据）
-const goDetail = (id) => router.push({ name: 'ImageDetail', params: { id } })
+const goDetail = (id) => {
+  const from = route.fullPath
+  router.push({ name: 'ImageDetail', params: { id }, query: { from } })
+}
 
 // #advise 批量模式：选中、工具条与退出
 const selectedCount = computed(() => selectedIds.value.length)

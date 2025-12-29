@@ -39,7 +39,8 @@ const loadError = ref('')
 // 右侧信息区和预览相关 UI 状态
 const activeTab = ref('basic')
 const zoom = ref(100)
-const fitMode = ref('width')
+const displayMode = ref('fillWidth')
+const imgLoading = ref(false)
 const showGps = ref(false)
 const newTag = ref('')
 const tagTypes = ['success', 'warning', 'info', 'danger']
@@ -55,13 +56,30 @@ const fileInfo = computed(() => ({
   dimension: image.value.width && image.value.height ? `${image.value.width} × ${image.value.height}` : '未知',
 }))
 
-const onBack = () => router.back()
+const getFromQuery = () => (typeof route.query.from === 'string' ? route.query.from : '')
+const decodeFrom = (raw) => {
+  if (!raw) return ''
+  try {
+    return decodeURIComponent(raw)
+  } catch {
+    return raw
+  }
+}
+const onBack = () => {
+  const rawFrom = getFromQuery()
+  const target = decodeFrom(rawFrom)
+  if (target && target !== route.fullPath) {
+    router.push(target)
+    return
+  }
+  router.push({ name: 'gallery' })
+}
 const changeZoom = (delta) => {
   zoom.value = Math.min(200, Math.max(50, zoom.value + delta))
 }
-const fitLabel = computed(() => (fitMode.value === 'width' ? '适应屏幕' : '宽度适配'))
+const fitLabel = computed(() => (displayMode.value === 'fillWidth' ? '适应屏幕' : '宽度适配'))
 const fitScreen = () => {
-  fitMode.value = fitMode.value === 'width' ? 'contain' : 'width'
+  displayMode.value = displayMode.value === 'fillWidth' ? 'fitScreen' : 'fillWidth'
   zoom.value = 100
 }
 // 顶部动作：下载与删除
@@ -197,7 +215,7 @@ const baseScale = computed(() => {
   const bw = bboxSize.value.w
   const bh = bboxSize.value.h
   if (!w || !h || !bw || !bh) return 1
-  if (fitMode.value === 'contain') {
+  if (displayMode.value === 'fitScreen') {
     return Math.min(w / bw, h / bh) * 0.98
   }
   return w / bw
@@ -226,6 +244,8 @@ const previewImgStyle = computed(() => {
 
 const fetchPreviewBlob = async (url) => {
   try {
+    imgLoading.value = true
+    loadError.value = ''
     const resp = await api.get(url, { responseType: 'blob' })
     if (blobUrl.value) URL.revokeObjectURL(blobUrl.value)
     blobUrl.value = URL.createObjectURL(resp.data)
@@ -233,16 +253,24 @@ const fetchPreviewBlob = async (url) => {
   } catch (err) {
     console.error('[preview] blob fetch failed', url, err)
     ElMessage.error('图片加载失败')
+    imgLoading.value = false
   }
 }
 
 const onImgError = async (e) => {
   const badUrl = e?.target?.src
   console.error('[preview] load error', badUrl)
-  if (badUrl && badUrl.startsWith('blob:')) return
+  if (badUrl && badUrl.startsWith('blob:')) {
+    imgLoading.value = false
+    loadError.value = '图片加载失败'
+    return
+  }
   if (image.value.url) {
     await fetchPreviewBlob(image.value.url)
+    return
   }
+  imgLoading.value = false
+  loadError.value = '图片加载失败'
 }
 
 const updateStageSize = () => {
@@ -256,6 +284,7 @@ const onPreviewLoad = async (e) => {
   imgNatural.value = { w: el.naturalWidth, h: el.naturalHeight }
   await nextTick()
   updateStageSize()
+  imgLoading.value = false
 }
 
 // 加载图片详情，附带版本戳破缓存，填充关系与标签
@@ -263,7 +292,9 @@ const loadDetail = async () => {
   try {
     loading.value = true
     loadError.value = ''
+    imgLoading.value = true
     previewSrc.value = ''
+    imgNatural.value = { w: 0, h: 0 }
     const { data } = await api.get(`/api/images/${route.params.id}`)
     const picked = pickUrl(data)
     const stamp =
@@ -299,9 +330,12 @@ const loadDetail = async () => {
     }
     suggestedTags.value = data.suggested_tags || data.suggestedTags || []
     previewSrc.value = absUrl
+    await nextTick()
+    updateStageSize()
   } catch (err) {
     ElMessage.error(err?.response?.data?.error || '加载图片详情失败')
     loadError.value = err?.response?.data?.error || err?.message || '加载失败'
+    imgLoading.value = false
   }
   loading.value = false
 }
@@ -344,7 +378,9 @@ onUnmounted(() => {
 })
 
 const goEdit = () => {
-  router.push({ name: 'imageEdit', params: { id: route.params.id } })
+  const from = getFromQuery()
+  const query = from ? { from } : {}
+  router.push({ name: 'imageEdit', params: { id: route.params.id }, query })
 }
 </script>
 
@@ -379,15 +415,19 @@ const goEdit = () => {
                 <el-button text :icon="FullScreen" @click="fitScreen">{{ fitLabel }}</el-button>
               </div>
             </div>
-            <div class="preview-body" :class="fitMode === 'contain' ? 'contain-mode' : 'width-mode'">
+            <div class="preview-body" :class="displayMode === 'fitScreen' ? 'fit-mode' : 'fill-mode'">
               <el-skeleton v-if="loading" :rows="6" animated style="width:100%;height:360px;" />
-              <div v-else ref="stageRef" class="img-stage" :class="fitMode === 'contain' ? 'contain-mode' : 'width-mode'">
+              <div v-else ref="stageRef" class="img-stage" :class="displayMode === 'fitScreen' ? 'fit-mode' : 'fill-mode'">
+                <div v-if="imgLoading" class="img-loading">
+                  <el-skeleton :rows="4" animated style="width:240px;height:160px;" />
+                </div>
                 <div v-if="previewSrc && !loadError" class="img-holder" :style="previewHolderStyle">
                   <img
                     :key="previewKey"
                     :src="previewSrc"
                     :alt="image.title"
                     :style="previewImgStyle"
+                    v-show="!imgLoading"
                     @load="onPreviewLoad"
                     @error="onImgError"
                   />
@@ -608,6 +648,7 @@ const goEdit = () => {
   gap: 16px;
   padding: 16px;
   overflow: hidden;
+  height: calc(100vh - var(--header-h) - 32px);
 }
 .preview-column {
   flex: 1;
@@ -665,10 +706,10 @@ const goEdit = () => {
   position: relative;
   display: flex;
 }
-.preview-body.width-mode {
+.preview-body.fill-mode {
   overflow: auto;
 }
-.preview-body.contain-mode {
+.preview-body.fit-mode {
   overflow: hidden;
 }
 .img-stage {
@@ -682,8 +723,17 @@ const goEdit = () => {
   align-items: center;
   justify-content: center;
 }
-.img-stage.width-mode {
+.img-stage.fill-mode {
   align-items: flex-start;
+}
+.img-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(255, 255, 255, 0.72);
+  border-radius: 8px;
+  z-index: 2;
 }
 .empty-preview {
   width: 100%;
@@ -697,6 +747,7 @@ const goEdit = () => {
   position: relative;
   display: inline-block;
   flex-shrink: 0;
+  z-index: 1;
 }
 .img-holder img {
   position: absolute;
@@ -1117,6 +1168,7 @@ const goEdit = () => {
     flex-direction: column;
     padding: 12px 10px;
     gap: 12px;
+    height: auto;
   }
 
   .side-column {
@@ -1182,6 +1234,7 @@ const goEdit = () => {
 @media (max-width: 1100px) {
   .detail-layout {
     flex-direction: column;
+    height: auto;
   }
   .preview-body {
     min-height: 320px;
