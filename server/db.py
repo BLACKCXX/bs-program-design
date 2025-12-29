@@ -1,12 +1,16 @@
 """
-超轻量 MySQL 访问层：不使用 ORM，只用 PyMySQL。
-- get_conn(): 每次请求时创建连接（pool 可后续替换）
-- dict_cursor: 返回 dict 行，便于 jsonify
+Lightweight MySQL access helpers built on PyMySQL.
+- get_conn(): create a connection using env variables
+- query / execute / executemany: convenience wrappers returning dict rows
 """
 import os
-import pymysql
 from contextlib import contextmanager
-import os, pymysql
+
+import pymysql
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 def _cfg():
     return dict(
@@ -17,15 +21,17 @@ def _cfg():
         database=os.getenv("DB_NAME", "bs_db"),
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
-        autocommit=False,  # 显式提交，保证事务性
+        autocommit=True,
     )
+
 
 def get_conn():
     return pymysql.connect(**_cfg())
 
+
 @contextmanager
 def dict_cursor():
-    """with dict_cursor() as cur: 既拿 cursor 也拿 conn，出错自动回滚"""
+    """Context manager yielding (conn, cursor) with rollback on error."""
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -37,16 +43,6 @@ def dict_cursor():
     finally:
         conn.close()
 
-def get_conn():
-    return pymysql.connect(
-        host=os.getenv("DB_HOST","127.0.0.1"),
-        user=os.getenv("DB_USER","root"),
-        password=os.getenv("DB_PASSWORD",""),
-        database=os.getenv("DB_NAME","bs"),
-        charset="utf8mb4",
-        autocommit=True,
-        cursorclass=pymysql.cursors.DictCursor
-    )
 
 def query(sql, args=None, many=False):
     conn = get_conn()
@@ -54,11 +50,13 @@ def query(sql, args=None, many=False):
         cur.execute(sql, args or ())
         return cur.fetchall()
 
+
 def execute(sql, args=None):
     conn = get_conn()
     with conn.cursor() as cur:
         cur.execute(sql, args or ())
         return cur.lastrowid
+
 
 def executemany(sql, rows):
     conn = get_conn()

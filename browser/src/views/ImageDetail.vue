@@ -1,17 +1,13 @@
   <script setup>
-// 页面职责：加载 /api/images/:id 的详情并承载编辑弹层，前端暂存裁剪/调节参数，导出时统一提交
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+// 页面职责：加载 /api/images/:id 的详情并展示预览/信息
+import { ref, computed, onUnmounted, watch, onMounted, nextTick } from 'vue'
 import api from '../api/http'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, Download, Delete as DeleteIcon, ZoomOut, ZoomIn, FullScreen, MagicStick } from '@element-plus/icons-vue'
-import { toDisplayUrl } from '../utils/url'
 
 const route = useRoute()
 const router = useRouter()
-
-// 统一展示 URL：相对路径优先，兼容绝对地址
-const toAbs = (p) => toDisplayUrl(p)
 
 // 图片详情的初始结构，避免响应式缺字段
 const emptyImage = {
@@ -33,13 +29,17 @@ const emptyImage = {
 const image = ref({ ...emptyImage })
 const suggestedTags = ref([])
 const savingTag = ref(false)
+const aiTagLoading = ref(false)
+const previewSrc = ref('')
+const blobUrl = ref('')
+const previewKey = computed(() => `${previewSrc.value || 'empty'}`)
+const loading = ref(false)
+const loadError = ref('')
 
 // 右侧信息区和预览相关 UI 状态
 const activeTab = ref('basic')
 const zoom = ref(100)
-const stageRef = ref(null)
-const stageSize = ref({ w: 0, h: 0 })
-let stageObserver = null
+const fitMode = ref('width')
 const showGps = ref(false)
 const newTag = ref('')
 const tagTypes = ['success', 'warning', 'info', 'danger']
@@ -59,7 +59,9 @@ const onBack = () => router.back()
 const changeZoom = (delta) => {
   zoom.value = Math.min(200, Math.max(50, zoom.value + delta))
 }
+const fitLabel = computed(() => (fitMode.value === 'width' ? '适应屏幕' : '宽度适配'))
 const fitScreen = () => {
+  fitMode.value = fitMode.value === 'width' ? 'contain' : 'width'
   zoom.value = 100
 }
 // 顶部动作：下载与删除
@@ -120,55 +122,162 @@ const addTag = async (tagPayload) => {
     newTag.value = ''
   }
 }
+const addAiTags = async () => {
+  if (!image.value.id || aiTagLoading.value) return
+  aiTagLoading.value = true
+  try {
+    const { data } = await api.post(`/api/images/${image.value.id}/ai_tags`)
+    const incoming = Array.isArray(data?.tags) ? data.tags : []
+    if (!incoming.length) {
+      ElMessage.info('AI 未返回标签')
+      return
+    }
+    const existing = new Set(image.value.tags || [])
+    const toAdd = incoming
+      .map((t) => String(t || '').trim())
+      .filter((t) => t && !existing.has(t))
+    if (!toAdd.length) {
+      ElMessage.info('标签已存在')
+      return
+    }
+    const { data: saved } = await api.post(`/api/images/${image.value.id}/tags/accept_suggestions`, { tags: toAdd })
+    const next = Array.isArray(saved?.tags)
+      ? saved.tags
+      : Array.from(new Set([...(image.value.tags || []), ...toAdd]))
+    image.value.tags = next
+    ElMessage.success('AI 标签已添加')
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || 'AI 标签添加失败')
+  } finally {
+    aiTagLoading.value = false
+  }
+}
 const toggleGps = () => {
   showGps.value = !showGps.value
 }
 
-const renderScale = computed(() => {
-  if (!imgNatural.value.w || !imgNatural.value.h || !stageSize.value.w || !stageSize.value.h) {
-    return zoom.value / 100
-  }
-  const base = Math.min(stageSize.value.w / imgNatural.value.w, stageSize.value.h / imgNatural.value.h)
-  return base * (zoom.value / 100)
-})
+const normalizeFilePath = (p = '') => {
+  if (!p) return ''
+  let clean = String(p).replace(/\\/g, '/').replace(/^\/+/, '')
+  clean = clean.replace(/^files\//, '')
+  return `/files/${encodeURI(clean)}`
+}
 
-const imgWrapStyle = computed(() => {
-  const w = imgNatural.value.w || 1
-  const h = imgNatural.value.h || 1
+const pickUrl = (data = {}) =>
+  data.url ||
+  data.cover_url ||
+  data.thumb_url ||
+  data.stored_path ||
+  data.path ||
+  data.thumb ||
+  ''
+
+const stageRef = ref(null)
+const stageSize = ref({ w: 0, h: 0 })
+const imgNatural = ref({ w: 0, h: 0 })
+let stageObserver = null
+
+const rotateDeg = computed(() => {
+  const raw = image.value.rotate ?? image.value.rotation ?? image.value.angle ?? 0
+  const val = Number(raw)
+  return Number.isFinite(val) ? val : 0
+})
+const bboxSize = computed(() => {
+  const w = imgNatural.value.w
+  const h = imgNatural.value.h
+  if (!w || !h) return { w: 0, h: 0 }
+  const rad = Math.abs((rotateDeg.value * Math.PI) / 180)
+  const cos = Math.abs(Math.cos(rad))
+  const sin = Math.abs(Math.sin(rad))
+  return { w: w * cos + h * sin, h: w * sin + h * cos }
+})
+const baseScale = computed(() => {
+  const w = stageSize.value.w
+  const h = stageSize.value.h
+  const bw = bboxSize.value.w
+  const bh = bboxSize.value.h
+  if (!w || !h || !bw || !bh) return 1
+  if (fitMode.value === 'contain') {
+    return Math.min(w / bw, h / bh) * 0.98
+  }
+  return w / bw
+})
+const renderScale = computed(() => baseScale.value * (zoom.value / 100))
+const renderBox = computed(() => ({
+  w: bboxSize.value.w ? bboxSize.value.w * renderScale.value : 0,
+  h: bboxSize.value.h ? bboxSize.value.h * renderScale.value : 0,
+}))
+const previewHolderStyle = computed(() => {
+  if (!renderBox.value.w || !renderBox.value.h) return {}
   return {
-    width: `${w}px`,
-    height: `${h}px`,
-    transform: `translate(-50%, -50%) scale(${renderScale.value})`,
+    width: `${renderBox.value.w}px`,
+    height: `${renderBox.value.h}px`,
+  }
+})
+const previewImgStyle = computed(() => {
+  if (!imgNatural.value.w || !imgNatural.value.h) return {}
+  return {
+    width: `${imgNatural.value.w}px`,
+    height: `${imgNatural.value.h}px`,
+    transform: `translate(-50%, -50%) rotate(${rotateDeg.value}deg) scale(${renderScale.value})`,
     transformOrigin: 'center center',
   }
 })
 
+const fetchPreviewBlob = async (url) => {
+  try {
+    const resp = await api.get(url, { responseType: 'blob' })
+    if (blobUrl.value) URL.revokeObjectURL(blobUrl.value)
+    blobUrl.value = URL.createObjectURL(resp.data)
+    previewSrc.value = blobUrl.value
+  } catch (err) {
+    console.error('[preview] blob fetch failed', url, err)
+    ElMessage.error('图片加载失败')
+  }
+}
+
+const onImgError = async (e) => {
+  const badUrl = e?.target?.src
+  console.error('[preview] load error', badUrl)
+  if (badUrl && badUrl.startsWith('blob:')) return
+  if (image.value.url) {
+    await fetchPreviewBlob(image.value.url)
+  }
+}
+
 const updateStageSize = () => {
-  const el = stageRef.value
-  if (!el) return
-  const rect = el.getBoundingClientRect()
+  const rect = stageRef.value?.getBoundingClientRect()
+  if (!rect) return
   stageSize.value = { w: rect.width, h: rect.height }
 }
 
-const imgNatural = ref({ w: 0, h: 0 })
-const imgBox = ref({ w: 0, h: 0 })
-const imgEl = ref(null)
-// 图片加载时记录原始尺寸与展示尺寸，后续裁剪换算使用
-const onImgLoad = (e) => {
+const onPreviewLoad = async (e) => {
   const el = e.target
   imgNatural.value = { w: el.naturalWidth, h: el.naturalHeight }
-  const rect = el.getBoundingClientRect()
-  imgBox.value = { w: rect.width, h: rect.height }
-  initCropRect()
+  await nextTick()
   updateStageSize()
 }
 
 // 加载图片详情，附带版本戳破缓存，填充关系与标签
 const loadDetail = async () => {
   try {
+    loading.value = true
+    loadError.value = ''
+    previewSrc.value = ''
     const { data } = await api.get(`/api/images/${route.params.id}`)
-    const versionTag = Date.now()
-    const absUrl = data.url ? `${toAbs(data.url)}?v=${versionTag}` : ''
+    const picked = pickUrl(data)
+    const stamp =
+      data.updated_at ||
+      data.updatedAt ||
+      data.updated ||
+      data.updatedAt ||
+      data.updated_at ||
+      data.updated_at ||
+      data.created_at ||
+      data.createdAt
+    const queryBust = Number(route.query.t)
+    const versionTag = Number.isFinite(queryBust) && queryBust > 0 ? queryBust : (stamp ? new Date(stamp).getTime() || Date.now() : Date.now())
+    const absUrl = picked ? `${normalizeFilePath(picked)}?v=${versionTag}` : ''
     image.value = {
       ...emptyImage,
       ...data,
@@ -176,27 +285,51 @@ const loadDetail = async () => {
       exif: data.exif || {},
       relations: {
         parent: data.relations?.parent
-          ? { ...data.relations.parent, thumb: data.relations.parent.thumb ? `${toAbs(data.relations.parent.thumb)}?v=${versionTag}` : '' }
+          ? {
+              ...data.relations.parent,
+              thumb: data.relations.parent.thumb ? `${normalizeFilePath(data.relations.parent.thumb)}?v=${versionTag}` : '',
+            }
           : null,
         children: (data.relations?.children || []).map((c) => ({
           ...c,
-          thumb: c.thumb ? `${toAbs(c.thumb)}?v=${versionTag}` : '',
+          thumb: c.thumb ? `${normalizeFilePath(c.thumb)}?v=${versionTag}` : '',
         })),
       },
       tags: data.tags || [],
     }
     suggestedTags.value = data.suggested_tags || data.suggestedTags || []
-    exportName.value = image.value.title || ''
+    previewSrc.value = absUrl
   } catch (err) {
     ElMessage.error(err?.response?.data?.error || '加载图片详情失败')
+    loadError.value = err?.response?.data?.error || err?.message || '加载失败'
   }
+  loading.value = false
 }
 
-onMounted(() => {
-  stageObserver = new ResizeObserver(updateStageSize)
-  if (stageRef.value) stageObserver.observe(stageRef.value)
-  updateStageSize()
+const refreshDetail = () => {
   loadDetail()
+}
+
+watch(
+  () => [route.params.id, route.query.t],
+  () => {
+    refreshDetail()
+  },
+  { immediate: true }
+)
+
+watch(
+  () => stageRef.value,
+  (el) => {
+    if (!el) return
+    stageObserver = stageObserver || new ResizeObserver(() => nextTick(updateStageSize))
+    stageObserver.observe(el)
+    nextTick(updateStageSize)
+  }
+)
+
+onMounted(() => {
+  nextTick(updateStageSize)
 })
 
 onUnmounted(() => {
@@ -204,378 +337,15 @@ onUnmounted(() => {
     stageObserver.disconnect()
     stageObserver = null
   }
-})
-
-// 编辑弹层状态：控制弹窗开关、对比模式与历史快照
-const showEditor = ref(false)
-const isCompare = ref(false)
-const history = ref([])
-
-// 裁剪参数：模式开关、比例、当前裁剪框、已应用裁剪、拖拽中间态
-const isCropping = ref(false)
-const cropRatio = ref('free')
-const customCropW = ref(1)
-const customCropH = ref(1)
-const cropRect = ref({ x: 0, y: 0, width: 0, height: 0 })
-const pendingCrop = ref(null)
-const dragState = ref(null)
-
-// 旋转范围与滤镜调节初始值
-const ROTATE_MIN = -180
-const ROTATE_MAX = 180
-const rotate = ref(0)
-
-const brightness = ref(0)
-const contrast = ref(0)
-const saturation = ref(0)
-const warmth = ref(0)
-const sharpen = ref(0)
-
-// 目标尺寸与锁比例配置
-const lockRatio = ref(true)
-const targetWidth = ref(null)
-const targetHeight = ref(null)
-
-const initCropRect = () => {
-  if (!imgNatural.value.w || !imgNatural.value.h) return
-  const w = imgNatural.value.w * 0.6
-  const h = imgNatural.value.h * 0.6
-  const x = (imgNatural.value.w - w) / 2
-  const y = (imgNatural.value.h - h) / 2
-  cropRect.value = { x, y, width: w, height: h }
-}
-
-// 将当前编辑状态压入 history，用于撤销
-const captureSnapshot = () => {
-  history.value.push({
-    cropRatio: cropRatio.value,
-    customCropW: customCropW.value,
-    customCropH: customCropH.value,
-    rotate: rotate.value,
-    brightness: brightness.value,
-    contrast: contrast.value,
-    saturation: saturation.value,
-    warmth: warmth.value,
-    sharpen: sharpen.value,
-    pendingCrop: pendingCrop.value ? { ...pendingCrop.value } : null,
-    cropRect: cropRect.value ? { ...cropRect.value } : null,
-    lockRatio: lockRatio.value,
-    targetWidth: targetWidth.value,
-    targetHeight: targetHeight.value,
-  })
-}
-
-const undo = () => {
-  const prev = history.value.pop()
-  if (!prev) return
-  // 恢复上一次快照的参数并退出裁剪模式
-  cropRatio.value = prev.cropRatio
-  customCropW.value = prev.customCropW
-  customCropH.value = prev.customCropH
-  rotate.value = prev.rotate
-  brightness.value = prev.brightness
-  contrast.value = prev.contrast
-  saturation.value = prev.saturation
-  warmth.value = prev.warmth
-  sharpen.value = prev.sharpen
-  pendingCrop.value = prev.pendingCrop ? { ...prev.pendingCrop } : null
-  cropRect.value = prev.cropRect ? { ...prev.cropRect } : { ...cropRect.value }
-  lockRatio.value = prev.lockRatio
-  targetWidth.value = prev.targetWidth
-  targetHeight.value = prev.targetHeight
-  isCropping.value = false
-}
-
-const toggleCropMode = () => {
-  isCropping.value = !isCropping.value
-  if (isCropping.value) {
-    // 进入裁剪模式时优先展示已应用裁剪框
-    if (pendingCrop.value) {
-      cropRect.value = { ...pendingCrop.value }
-    } else {
-      initCropRect()
-    }
-  }
-}
-
-const cancelCrop = () => {
-  isCropping.value = false
-  if (pendingCrop.value) {
-    cropRect.value = { ...pendingCrop.value }
-  } else {
-    initCropRect()
-  }
-}
-
-const setCrop = (val) => {
-  captureSnapshot()
-  cropRatio.value = val
-}
-const setCustomCrop = () => {
-  if (customCropW.value > 0 && customCropH.value > 0) {
-    captureSnapshot()
-    cropRatio.value = `${customCropW.value}:${customCropH.value}`
-  }
-}
-
-const rotateStep = (delta) => {
-  captureSnapshot()
-  let next = rotate.value + delta
-  if (next > ROTATE_MAX) next -= 360
-  if (next < ROTATE_MIN) next += 360
-  rotate.value = next
-}
-const rotateSliderChange = (val) => {
-  captureSnapshot()
-  rotate.value = val
-}
-
-const resetAdjust = () => {
-  captureSnapshot()
-  brightness.value = 0
-  contrast.value = 0
-  saturation.value = 0
-  warmth.value = 0
-  sharpen.value = 0
-}
-
-// 尺寸调整：根据锁定比例自动推算宽高，导出时生效
-const applySize = () => {
-  if (lockRatio.value) {
-    const parts = cropRatio.value && cropRatio.value !== 'free' ? cropRatio.value.split(':') : [image.value.width || 1, image.value.height || 1]
-    const rw = Number(parts[0]) || 1
-    const rh = Number(parts[1]) || 1
-    if (targetWidth.value && !targetHeight.value) {
-      targetHeight.value = Math.round((targetWidth.value / rw) * rh)
-    } else if (!targetWidth.value && targetHeight.value) {
-      targetWidth.value = Math.round((targetHeight.value / rh) * rw)
-    }
-  }
-  ElMessage.info('尺寸参数已应用，导出时生效')
-}
-
-// 裁剪应用：前端保存 pendingCrop，导出时一起提交
-const cropLoading = ref(false)
-const applyCrop = () => {
-  if (!isCropping.value) {
-    ElMessage.warning('请先进入裁剪模式并调整裁剪框')
-    return
-  }
-  if (cropLoading.value) return
-  cropLoading.value = true
-  try {
-    captureSnapshot()
-    pendingCrop.value = { ...cropRect.value }
-    isCropping.value = false
-    ElMessage.success('已应用裁剪，导出时会一并提交')
-  } finally {
-    cropLoading.value = false
-  }
-}
-
-// 关闭编辑器时重置所有临时状态与调节参数
-const resetEditingState = () => {
-  pendingCrop.value = null
-  isCropping.value = false
-  cropRatio.value = 'free'
-  customCropW.value = 1
-  customCropH.value = 1
-  rotate.value = 0
-  brightness.value = 0
-  contrast.value = 0
-  saturation.value = 0
-  warmth.value = 0
-  sharpen.value = 0
-  targetWidth.value = null
-  targetHeight.value = null
-  lockRatio.value = true
-  history.value = []
-  isCompare.value = false
-  exportName.value = image.value.title || ''
-  initCropRect()
-}
-
-const closeEditor = () => {
-  resetEditingState()
-  showEditor.value = false
-}
-
-const exportMode = ref('override')
-const exportName = ref('')
-const onExport = async () => {
-  if (exportMode.value === 'new' && !exportName.value.trim()) {
-    ElMessage.warning('请先输入导出名称')
-    return
-  }
-  // 组装导出载荷：包含裁剪框、旋转、基础调节、目标尺寸
-  const ratioParts = cropRatio.value && cropRatio.value !== 'free' ? cropRatio.value.split(':') : []
-  const cropPayload = pendingCrop.value ? { ...pendingCrop.value } : (isCropping.value ? { ...cropRect.value } : null)
-  const payload = {
-    mode: exportMode.value,
-    exportName: exportName.value || image.value.title,
-    rotate: rotate.value,
-    crop_ratio: cropRatio.value,
-    brightness: brightness.value,
-    contrast: contrast.value,
-    saturation: saturation.value,
-    warmth: warmth.value,
-    sharpen: sharpen.value,
-    crop_rect: cropPayload,
-    target_width: targetWidth.value,
-    target_height: targetHeight.value,
-    keep_ratio: lockRatio.value,
-    ratio_width: ratioParts.length === 2 ? Number(ratioParts[0]) || null : null,
-    ratio_height: ratioParts.length === 2 ? Number(ratioParts[1]) || null : null,
-  }
-  try {
-    const { data } = await api.post(`/api/images/${image.value.id}/edit`, payload)
-    ElMessage.success('导出成功')
-    if (data?.mode === 'new' && data?.image_id) {
-      await router.replace({ name: 'ImageDetail', params: { id: data.image_id } })
-    } else {
-      await loadDetail()
-    }
-    closeEditor()
-  } catch (err) {
-    ElMessage.error(err?.response?.data?.error || '导出失败')
-  }
-}
-
-const startDrag = (evt, mode) => {
-  if (!isCropping.value) return
-  const rect = imgEl.value?.getBoundingClientRect()
-  if (!rect) return
-  // 记录拖拽起点与当前裁剪框，后续换算到原图坐标
-  dragState.value = {
-    mode,
-    startX: evt.clientX,
-    startY: evt.clientY,
-    box: rect,
-    cropStart: { ...cropRect.value },
-  }
-  window.addEventListener('mousemove', onDrag)
-  window.addEventListener('mouseup', endDrag)
-}
-
-const onDrag = (evt) => {
-  const st = dragState.value
-  if (!st) return
-  const dx = evt.clientX - st.startX
-  const dy = evt.clientY - st.startY
-  const fx = imgNatural.value.w / st.box.width
-  const fy = imgNatural.value.h / st.box.height
-  let { x, y, width, height } = st.cropStart
-  const moveX = dx * fx
-  const moveY = dy * fy
-
-  const clamp = () => {
-    x = Math.max(0, Math.min(imgNatural.value.w - width, x))
-    y = Math.max(0, Math.min(imgNatural.value.h - height, y))
-    width = Math.max(10, Math.min(imgNatural.value.w - x, width))
-    height = Math.max(10, Math.min(imgNatural.value.h - y, height))
-  }
-
-  if (st.mode === 'move') {
-    x += moveX
-    y += moveY
-    clamp()
-  } else {
-    if (st.mode.includes('e')) {
-      width += moveX
-    }
-    if (st.mode.includes('w')) {
-      x += moveX
-      width -= moveX
-    }
-    if (st.mode.includes('s')) {
-      height += moveY
-    }
-    if (st.mode.includes('n')) {
-      y += moveY
-      height -= moveY
-    }
-    clamp()
-  }
-  cropRect.value = { x, y, width, height }
-}
-
-const endDrag = () => {
-  window.removeEventListener('mousemove', onDrag)
-  window.removeEventListener('mouseup', endDrag)
-  dragState.value = null
-}
-
-// 已应用的裁剪（退出裁剪模式后使用 pendingCrop 渲染预览）
-const appliedCrop = computed(() => (!isCropping.value ? pendingCrop.value : null))
-const editedStyle = computed(() => {
-  const filters = [
-    `brightness(${1 + brightness.value / 100})`,
-    `contrast(${1 + contrast.value / 100})`,
-    `saturate(${1 + saturation.value / 100})`,
-  ]
-  const style = {
-    filter: filters.join(' '),
-  }
-  const crop = appliedCrop.value
-  const { w, h } = imgNatural.value
-  if (crop && w && h && crop.width && crop.height) {
-    const scaleX = w / crop.width
-    const scaleY = h / crop.height
-    style.width = `${scaleX * 100}%`
-    style.height = `${scaleY * 100}%`
-    style.transformOrigin = 'top left'
-    const translateX = -(crop.x / crop.width) * 100
-    const translateY = -(crop.y / crop.height) * 100
-    style.transform = `translate(${translateX}%, ${translateY}%) rotate(${rotate.value}deg)`
-  } else {
-    style.transform = `rotate(${rotate.value}deg)`
-  }
-  return style
-})
-
-const cropRectStyle = computed(() => {
-  if (!isCropping.value) return {}
-  const { w: dw, h: dh } = imgBox.value
-  const { w: nw, h: nh } = imgNatural.value
-  if (!dw || !dh || !nw || !nh) return {}
-  const fx = dw / nw
-  const fy = dh / nh
-  const { x, y, width, height } = cropRect.value
-  return {
-    left: `${x * fx}px`,
-    top: `${y * fy}px`,
-    width: `${width * fx}px`,
-    height: `${height * fy}px`,
+  if (blobUrl.value) {
+    URL.revokeObjectURL(blobUrl.value)
+    blobUrl.value = ''
   }
 })
 
-const cropBoxStyle = computed(() => {
-  if (isCropping.value) {
-    const { w: dw, h: dh } = imgBox.value
-    const { w: nw, h: nh } = imgNatural.value
-    if (!dw || !dh || !nw || !nh) return {}
-    return { position: 'relative', alignItems: 'start', justifyItems: 'start' }
-  }
-  const applied = appliedCrop.value
-  if (applied && applied.width && applied.height) {
-    return {
-      aspectRatio: `${applied.width} / ${applied.height}`,
-      overflow: 'hidden',
-      position: 'relative',
-      alignItems: 'start',
-      justifyItems: 'start',
-    }
-  }
-  if (!cropRatio.value || cropRatio.value === 'free') return {}
-  const parts = cropRatio.value.split(':')
-  if (parts.length !== 2) return {}
-  const w = Number(parts[0]) || 1
-  const h = Number(parts[1]) || 1
-  return {
-    aspectRatio: `${w} / ${h}`,
-    overflow: 'hidden',
-  }
-})
+const goEdit = () => {
+  router.push({ name: 'imageEdit', params: { id: route.params.id } })
+}
 </script>
 
 <template>
@@ -590,7 +360,7 @@ const cropBoxStyle = computed(() => {
         <span class="title">{{ image.title }}</span>
       </div>
       <div class="top-actions">
-        <el-button text type="primary" :icon="MagicStick" @click="showEditor = true">图片编辑</el-button>
+        <el-button text type="primary" :icon="MagicStick" @click="goEdit">图片编辑</el-button>
         <el-button text :icon="Download" @click="onDownload">下载</el-button>
         <el-button text type="danger" :icon="DeleteIcon" @click="onDelete">删除</el-button>
       </div>
@@ -599,25 +369,36 @@ const cropBoxStyle = computed(() => {
     <!-- 左侧预览区 + 右侧信息与标签 -->
     <section class="detail-layout">
       <div class="preview-column">
-        <div class="panel preview-panel">
-          <div class="panel-header">
-            <span class="panel-title">预览</span>
-            <div class="zoom-bar">
-              <el-button text :icon="ZoomOut" @click="changeZoom(-10)" />
-              <span class="zoom-text">{{ zoom }}%</span>
-              <el-button text :icon="ZoomIn" @click="changeZoom(10)" />
-              <el-button text :icon="FullScreen" @click="fitScreen">适应屏幕</el-button>
+          <div class="panel preview-panel">
+            <div class="panel-header">
+              <span class="panel-title">预览</span>
+              <div class="zoom-bar">
+                <el-button text :icon="ZoomOut" @click="changeZoom(-10)" />
+                <span class="zoom-text">{{ zoom }}%</span>
+                <el-button text :icon="ZoomIn" @click="changeZoom(10)" />
+                <el-button text :icon="FullScreen" @click="fitScreen">{{ fitLabel }}</el-button>
+              </div>
             </div>
-          </div>
-          <div class="preview-body">
-            <div class="img-stage" ref="stageRef">
-              <div class="img-wrap" :style="imgWrapStyle">
-                <img :src="image.url" :alt="image.title" />
+            <div class="preview-body" :class="fitMode === 'contain' ? 'contain-mode' : 'width-mode'">
+              <el-skeleton v-if="loading" :rows="6" animated style="width:100%;height:360px;" />
+              <div v-else ref="stageRef" class="img-stage" :class="fitMode === 'contain' ? 'contain-mode' : 'width-mode'">
+                <div v-if="previewSrc && !loadError" class="img-holder" :style="previewHolderStyle">
+                  <img
+                    :key="previewKey"
+                    :src="previewSrc"
+                    :alt="image.title"
+                    :style="previewImgStyle"
+                    @load="onPreviewLoad"
+                    @error="onImgError"
+                  />
+                </div>
+                <div v-else class="empty-preview">
+                  <p>{{ loadError || '暂无图片' }}</p>
+                </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
 
       <div class="side-column">
         <el-tabs v-model="activeTab" class="side-tabs">
@@ -652,7 +433,10 @@ const cropBoxStyle = computed(() => {
           <el-tab-pane label="标签" name="tags">
             <div class="block header-row">
               <div class="block-title">图片标签</div>
-              <el-button text type="primary" :loading="savingTag" @click="addTag">+ 添加标签</el-button>
+              <div class="tag-actions">
+                <el-button text type="primary" :loading="aiTagLoading" @click="addAiTags">AI 添加</el-button>
+                <el-button text type="primary" :loading="savingTag" @click="addTag">+ 添加标签</el-button>
+              </div>
             </div>
             <div class="tag-list">
               <el-tag
@@ -771,170 +555,19 @@ const cropBoxStyle = computed(() => {
       </div>
     </section>
 
-    <el-dialog v-model="showEditor" fullscreen :show-close="false" class="editor-dialog">
-      <div class="editor-header">
-        <div class="editor-title">图片编辑 - {{ image.title || '未命名' }}</div>
-        <el-button type="primary" @click="closeEditor">关闭</el-button>
-      </div>
-      <div class="editor-body">
-        <div class="editor-left">
-          <div class="editor-toolbar">
-            <div class="toolbar-actions">
-              <el-button size="small" @click="isCompare = !isCompare" :disabled="isCropping">{{ isCompare ? '退出对比' : '双栏对比' }}</el-button>
-              <el-button size="small" @click="undo">撤销</el-button>
-            </div>
-          </div>
-          <div class="editor-stage">
-            <div v-if="isCompare" class="compare-grid">
-              <div class="card neutral">
-                <div class="card-title">原图</div>
-                <div class="card-img" :style="cropBoxStyle">
-                  <img :src="image.url" :alt="image.title" />
-                </div>
-              </div>
-              <div class="card neutral">
-                <div class="card-title">编辑后</div>
-                <div class="card-img" :style="cropBoxStyle" ref="imgEl">
-                  <img :src="image.url" :alt="image.title" :style="editedStyle" @load="onImgLoad" />
-                  <div class="crop-overlay" v-if="isCropping">
-                    <div class="crop-mask"></div>
-                    <div class="crop-rect" :style="cropRectStyle" @mousedown.prevent="startDrag($event, 'move')">
-                      <span class="handle handle-nw" @mousedown.stop.prevent="startDrag($event, 'nw')"></span>
-                      <span class="handle handle-ne" @mousedown.stop.prevent="startDrag($event, 'ne')"></span>
-                      <span class="handle handle-sw" @mousedown.stop.prevent="startDrag($event, 'sw')"></span>
-                      <span class="handle handle-se" @mousedown.stop.prevent="startDrag($event, 'se')"></span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div v-else class="single-card neutral">
-              <div class="card-title">编辑后</div>
-              <div class="card-img" :style="cropBoxStyle" ref="imgEl">
-                <img :src="image.url" :alt="image.title" :style="editedStyle" @load="onImgLoad" />
-                <div class="crop-overlay" v-if="isCropping">
-                  <div class="crop-mask"></div>
-                  <div class="crop-rect" :style="cropRectStyle" @mousedown.prevent="startDrag($event, 'move')">
-                    <span class="handle handle-nw" @mousedown.stop.prevent="startDrag($event, 'nw')"></span>
-                    <span class="handle handle-ne" @mousedown.stop.prevent="startDrag($event, 'ne')"></span>
-                    <span class="handle handle-sw" @mousedown.stop.prevent="startDrag($event, 'sw')"></span>
-                    <span class="handle handle-se" @mousedown.stop.prevent="startDrag($event, 'se')"></span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="editor-right">
-          <el-scrollbar class="right-scroll">
-            <div class="panel neutral">
-              <div class="panel-title">裁剪</div>
-              <div class="ratio-row crop-actions">
-                <el-button size="small" :type="isCropping ? 'primary' : 'default'" :disabled="isCropping" @click="toggleCropMode">裁剪</el-button>
-                <el-button size="small" type="primary" @click="applyCrop" :disabled="!isCropping" :loading="cropLoading">应用裁剪</el-button>
-                <el-button size="small" @click="cancelCrop" :disabled="!isCropping">取消裁剪</el-button>
-              </div>
-            </div>
-
-            <div class="panel neutral">
-              <div class="panel-title">照片尺寸</div>
-              <div class="ratio-row">
-                <el-button-group>
-                  <el-button :type="cropRatio === 'free' ? 'primary' : 'default'" @click="setCrop('free')">自由</el-button>
-                  <el-button :type="cropRatio === '1:1' ? 'primary' : 'default'" @click="setCrop('1:1')">1:1</el-button>
-                  <el-button :type="cropRatio === '4:3' ? 'primary' : 'default'" @click="setCrop('4:3')">4:3</el-button>
-                  <el-button :type="cropRatio === '16:9' ? 'primary' : 'default'" @click="setCrop('16:9')">16:9</el-button>
-                </el-button-group>
-                <div class="custom-ratio">
-                  <span class="custom-label">自定义：</span>
-                  <el-input-number v-model="customCropW" size="small" :min="1" @change="setCustomCrop" controls-position="right" />
-                  <span class="colon">:</span>
-                  <el-input-number v-model="customCropH" size="small" :min="1" @change="setCustomCrop" controls-position="right" />
-                </div>
-              </div>
-              <div class="ratio-row">
-                <el-input-number v-model="targetWidth" :min="1" size="small" placeholder="宽(px)" />
-                <el-input-number v-model="targetHeight" :min="1" size="small" placeholder="高(px)" />
-                <el-checkbox v-model="lockRatio">锁定比例</el-checkbox>
-                <el-button size="small" type="primary" @click="applySize">应用尺寸</el-button>
-              </div>
-            </div>
-
-            <div class="panel neutral">
-              <div class="panel-title">旋转</div>
-              <div class="rotate-row">
-                <el-button size="small" @click="rotateStep(-90)">-90°</el-button>
-                <el-button size="small" @click="rotateStep(90)">+90°</el-button>
-                <span class="rotate-text">角度：{{ rotate }}°</span>
-              </div>
-              <div class="rotate-slider">
-                <el-slider v-model="rotate" :min="ROTATE_MIN" :max="ROTATE_MAX" :step="1" @change="rotateSliderChange" />
-              </div>
-            </div>
-
-            <div class="panel neutral">
-              <div class="panel-title">调节</div>
-              <div class="slider-row">
-                <span>亮度</span>
-                <el-slider v-model="brightness" :min="-100" :max="100" @change="captureSnapshot" />
-              </div>
-              <div class="slider-row">
-                <span>对比度</span>
-                <el-slider v-model="contrast" :min="-100" :max="100" @change="captureSnapshot" />
-              </div>
-              <div class="slider-row">
-                <span>饱和度</span>
-                <el-slider v-model="saturation" :min="-100" :max="100" @change="captureSnapshot" />
-              </div>
-              <div class="slider-row">
-                <span>色温</span>
-                <el-slider v-model="warmth" :min="-100" :max="100" @change="captureSnapshot" />
-              </div>
-              <div class="slider-row">
-                <span>锐化</span>
-                <el-slider v-model="sharpen" :min="0" :max="100" @change="captureSnapshot" />
-              </div>
-              <div class="slider-row reset-row">
-                <el-button size="small" @click="resetAdjust">重置所有调节</el-button>
-              </div>
-            </div>
-
-            <div class="panel neutral">
-              <div class="panel-title">导出 / 版本</div>
-              <div class="export-row">
-                <el-radio-group v-model="exportMode">
-                  <el-radio label="override">覆盖原图</el-radio>
-                  <el-radio label="new">导出为新图片</el-radio>
-                </el-radio-group>
-              </div>
-              <div class="export-name">
-                <span class="export-label">导出名称：</span>
-                <el-input v-model="exportName" placeholder="请输入导出图片名称" size="small" />
-                <div class="export-tip">
-                  {{ exportMode === 'override' ? '覆盖时会以此名称更新原图标题' : '为新图片命名后再导出' }}
-                </div>
-              </div>
-              <div class="export-actions">
-                <el-button type="primary" @click="onExport">导出并保存</el-button>
-                <el-button @click="closeEditor">取消</el-button>
-              </div>
-              <div class="export-note">
-                <p>提示：未来可用“新建+删除原图”方式实现覆盖。</p>
-              </div>
-            </div>
-          </el-scrollbar>
-        </div>
-      </div>
-    </el-dialog>
   </div>
 </template>
 
 <style scoped>
 .detail-page {
+  --header-h: 72px;
   background: #f5f7fa;
-  min-height: 100vh;
-  padding-bottom: 24px;
+  height: 100vh;
+  overflow: hidden;
+  padding-bottom: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .detail-top {
   position: sticky;
@@ -946,6 +579,7 @@ const cropBoxStyle = computed(() => {
   padding: 12px 18px;
   background: #fff;
   border-bottom: 1px solid #e5e7eb;
+  flex: 0 0 var(--header-h);
 }
 .top-left {
   display: flex;
@@ -968,17 +602,26 @@ const cropBoxStyle = computed(() => {
   gap: 6px;
 }
 .detail-layout {
+  flex: 1;
+  min-height: 0;
   display: flex;
   gap: 16px;
   padding: 16px;
+  overflow: hidden;
 }
 .preview-column {
-  flex: 3.4;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
 }
 .side-column {
-  flex: 1.2;
+  flex: 0 0 380px;
   max-width: 420px;
-  min-width: 320px;
+  min-width: 340px;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 .panel {
   background: #fff;
@@ -986,6 +629,12 @@ const cropBoxStyle = computed(() => {
   border-radius: 12px;
   padding: 12px;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.02);
+}
+.preview-panel {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .panel-header {
   display: flex;
@@ -1011,34 +660,65 @@ const cropBoxStyle = computed(() => {
   background: linear-gradient(135deg, #eef2f7, #e5e7eb);
   border-radius: 10px;
   padding: 16px;
-  min-height: 520px;
+  flex: 1;
+  min-height: 0;
   position: relative;
+  display: flex;
+}
+.preview-body.width-mode {
+  overflow: auto;
+}
+.preview-body.contain-mode {
   overflow: hidden;
 }
 .img-stage {
-  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
   width: 100%;
   height: 100%;
-  min-height: 320px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
-.img-wrap {
+.img-stage.width-mode {
+  align-items: flex-start;
+}
+.empty-preview {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: #9ca3af;
+  font-size: 14px;
+}
+.img-holder {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.img-holder img {
   position: absolute;
   left: 50%;
   top: 50%;
-  transition: transform 0.2s ease;
-}
-.img-wrap img {
   display: block;
-  width: 100%;
-  height: 100%;
+  max-width: none;
+  max-height: none;
   border-radius: 8px;
-  object-fit: contain;
 }
 .side-tabs {
   background: #fff;
   border: 1px solid #e5e7eb;
   border-radius: 12px;
   padding: 10px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+:deep(.side-tabs .el-tabs__content) {
+  flex: 1;
+  overflow: auto;
 }
 .block {
   margin-bottom: 16px;
@@ -1052,6 +732,11 @@ const cropBoxStyle = computed(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+.tag-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .tag-list {
   display: flex;
@@ -1248,7 +933,14 @@ const cropBoxStyle = computed(() => {
   background: #fff;
   border: 1px solid #e5e7eb;
   border-radius: 12px;
-  overflow: hidden;
+  overflow: auto; /* 放大时可滚动查看 */
+  min-height: 0;
+}
+.single-card {
+  padding: 10px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
 }
 .editor-stage > .single-card,
@@ -1274,6 +966,7 @@ const cropBoxStyle = computed(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
+  min-height: 0;
 }
 .card {
   padding: 10px;
@@ -1294,11 +987,11 @@ const cropBoxStyle = computed(() => {
   min-height: 260px;
   width: 100%;
   height: 100%;
-  overflow: hidden;
+  overflow: auto; /* 放大时允许滚动 */
 }
 .card-img img {
-  max-width: 92%;
-  max-height: 92%;
+  max-width: 100%;
+  max-height: 100%;
   border-radius: 12px;
   object-fit: contain;
 }
@@ -1452,8 +1145,8 @@ const cropBoxStyle = computed(() => {
     padding: 12px;
   }
 
-  .img-wrap,
-  .img-wrap img {
+  .img-holder,
+  .img-holder img {
     max-height: 60vh;
   }
 

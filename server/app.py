@@ -350,7 +350,9 @@ def create_app() -> Flask:
     # 注：使用相对导入，保持包内解析稳定
     # -------------------------------------------------------------------------
     from .routes_images import bp as images_bp
+    from .routes_ai import bp as ai_bp
     app.register_blueprint(images_bp)
+    app.register_blueprint(ai_bp)
 
     return app
 

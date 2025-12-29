@@ -4,6 +4,7 @@ import MainLayout from '../layouts/MainLayout.vue'
 import Auth from '../views/Auth.vue'
 import Gallery from '../views/Gallery.vue'   // 首页
 import ImageDetail from '../views/ImageDetail.vue' // 图片详情
+import ImageEditor from '../views/ImageEditor.vue'
 import SearchEngine from '../views/SearchEngine.vue'
 import UploadCenter from '../views/UploadCenter.vue'
 import AiWorkspace from '../views/AiWorkspace.vue'
@@ -22,6 +23,7 @@ const router = createRouter({
         { path: 'search', name: 'search', component: SearchEngine, meta: { auth: true } },
         { path: 'upload', name: 'upload', component: UploadCenter, meta: { auth: true } },
         { path: 'ai', name: 'ai', component: AiWorkspace, meta: { auth: true } },
+        { path: 'images/:id/edit', name: 'imageEdit', component: ImageEditor, meta: { auth: true } },
         { path: 'images/:id', name: 'ImageDetail', component: ImageDetail, meta: { auth: true } },
       ],
     },

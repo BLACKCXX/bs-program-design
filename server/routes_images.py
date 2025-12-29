@@ -10,11 +10,12 @@ import tempfile
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file, send_from_directory
 from flask_jwt_extended import get_jwt_identity, jwt_required
-from PIL import Image, ImageEnhance, ImageOps  # 简单图像处理
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps  # 简单图像处理
 
 from server.db import execute, executemany, query
 from server.photo_analysis_agent import analyze_image
 from server.util_exif import extract_exif
+from server.utils import classify_device
 
 import jwt
 
@@ -31,6 +32,22 @@ ALLOWED_MIMES = {
 }
 TMP_AI_DIR = os.path.join(tempfile.gettempdir(), "bs_ai_tmp")
 os.makedirs(TMP_AI_DIR, exist_ok=True)
+
+
+def _facet_from_sql(field_expr: str, owner_id: int, limit: int = 50):
+    sql = f"""
+        SELECT val AS value, COUNT(*) AS cnt FROM (
+            SELECT TRIM({field_expr}) AS val
+            FROM images i
+            LEFT JOIN exif e ON e.image_id = i.id
+            WHERE i.owner_id=%s AND {field_expr} IS NOT NULL AND TRIM({field_expr})!=''
+        ) t
+        GROUP BY val
+        ORDER BY cnt DESC, val ASC
+        LIMIT %s
+    """
+    rows = query(sql, (owner_id, limit))
+    return [{"value": r["value"], "count": r["cnt"]} for r in rows]
 
 # ===== 简易鉴权（沿用当前 JWT 配置）=====
 '''
@@ -70,11 +87,83 @@ def _current_user_id_from_jwt():
     return uid
 
 
+_VISIBILITY_COLUMN = None
+
+
+def _has_visibility_column() -> bool:
+    global _VISIBILITY_COLUMN
+    if _VISIBILITY_COLUMN is not None:
+        return _VISIBILITY_COLUMN
+    try:
+        rows = query(
+            """
+            SELECT 1
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME='images'
+              AND COLUMN_NAME='visibility'
+            LIMIT 1
+            """
+        )
+        _VISIBILITY_COLUMN = bool(rows)
+    except Exception:
+        _VISIBILITY_COLUMN = False
+    return _VISIBILITY_COLUMN
+
+
 # ===== 静态文件回显（/files/<path>）=====
 @bp.get("/files/<path:subpath>")
 def serve_file(subpath):
     root = os.path.abspath(current_app.config["UPLOAD_DIR"])
     return send_from_directory(root, subpath)
+
+
+@bp.get("/api/images/facets")
+@jwt_required()
+def image_facets():
+    """聚合建议：相机品牌/型号/格式/设备"""
+    g.user_id = _current_user_id_from_jwt()
+    try:
+        facets = {
+            "camera_make": _facet_from_sql("COALESCE(e.camera_make, i.camera_make)", g.user_id),
+            "camera_model": _facet_from_sql("COALESCE(e.camera_model, i.camera_model)", g.user_id),
+        }
+
+        # 格式：从 stored_path/path/mime 取扩展名
+        fmt_rows = query(
+            """
+            SELECT LOWER(SUBSTRING_INDEX(COALESCE(i.stored_path,i.path),'.',-1)) AS fmt, COUNT(*) AS cnt
+            FROM images i
+            WHERE i.owner_id=%s AND COALESCE(i.stored_path,i.path) IS NOT NULL
+            GROUP BY fmt
+            HAVING fmt IS NOT NULL AND fmt!=''
+            ORDER BY cnt DESC, fmt ASC
+            LIMIT 50
+            """,
+            (g.user_id,),
+        )
+        facets["format"] = [{"value": r["fmt"], "count": r["cnt"]} for r in fmt_rows if r.get("fmt")]
+
+        # 设备：根据品牌/型号粗分
+        dev_rows = query(
+            """
+            SELECT COALESCE(e.camera_make, i.camera_make) AS make, COALESCE(e.camera_model, i.camera_model) AS model
+            FROM images i
+            LEFT JOIN exif e ON e.image_id = i.id
+            WHERE i.owner_id=%s
+            """,
+            (g.user_id,),
+        )
+        device_count = {}
+        for r in dev_rows:
+            dev = classify_device(r.get("make"), r.get("model"))
+            if dev:
+                device_count[dev] = device_count.get(dev, 0) + 1
+        facets["device"] = [{"value": k, "count": v} for k, v in sorted(device_count.items(), key=lambda x: x[1], reverse=True)]
+
+        return jsonify(facets)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "聚合失败", "detail": str(exc)}), 500
 
 
 # ===== AI 智能分析 =====
@@ -397,6 +486,8 @@ def search_images():
     args = request.args
     limit = int(args.get("limit", 50))
     offset = int(args.get("offset", 0))
+    if limit > 200:
+        limit = 200
 
     q = (args.get("q") or "").strip()
     date_start = (args.get("date_start") or "").strip()
@@ -408,6 +499,11 @@ def search_images():
     focal_length = (args.get("focal_length") or "").strip()
     min_size = (args.get("min_size_mb") or "").strip()
     max_size = (args.get("max_size_mb") or "").strip()
+    device_params = args.getlist("device") or []
+    if not device_params and args.get("device"):
+        device_params = [p.strip() for p in (args.get("device") or "").split(",") if p.strip()]
+    min_size_kb = (args.get("min_size_kb") or "").strip()
+    max_size_kb = (args.get("max_size_kb") or "").strip()
 
     tag_params = args.getlist("tags") or []
     if not tag_params and args.get("tags"):
@@ -465,15 +561,25 @@ def search_images():
     # 文件大小（MB）
     size_expr = "COALESCE(i.size_bytes, i.size) / 1024 / 1024.0"
     try:
-        if min_size:
+        if min_size_kb:
+            min_size_val = max(0.0, float(min_size_kb) / 1024.0)
             conditions.append(f"{size_expr} >= %s")
-            params.append(float(min_size))
+            params.append(min_size_val)
+        elif min_size:
+            min_size_val = max(0.0, float(min_size))
+            conditions.append(f"{size_expr} >= %s")
+            params.append(min_size_val)
     except Exception:
         pass
     try:
-        if max_size:
+        if max_size_kb:
+            max_size_val = min(float(max_size_kb) / 1024.0, 10.0)
             conditions.append(f"{size_expr} <= %s")
-            params.append(float(max_size))
+            params.append(max_size_val)
+        elif max_size:
+            max_size_val = min(float(max_size), 10.0)
+            conditions.append(f"{size_expr} <= %s")
+            params.append(max_size_val)
     except Exception:
         pass
 
@@ -537,7 +643,8 @@ def search_images():
         rel_path = (r.get("stored_path") or r.get("path") or "").strip()
         date_val = r.get("sort_time") or r.get("taken_at") or r.get("created_at")
         taken = date_val.strftime("%Y-%m-%d") if date_val else None
-        size_mb = round((r.get("size_bytes") or 0) / 1024 / 1024, 1)
+        size_mb = round((r.get("size_bytes") or 0) / 1024 / 1024, 2)
+        device = classify_device(r.get("camera_make"), r.get("camera_model"))
         return {
             "id": r["id"],
             "title": r.get("title") or "未命名",
@@ -546,9 +653,14 @@ def search_images():
             "date": taken,
             "sizeMB": size_mb,
             "url": f"/files/{rel_path}" if rel_path else "",
+            "device": device,
         }
 
-    return jsonify({"items": [fmt_row(r) for r in rows]})
+    items = [fmt_row(r) for r in rows]
+    if device_params:
+        items = [it for it in items if it.get("device") and it["device"] in device_params]
+
+    return jsonify({"items": items})
 
 
 # ===== #advise 热门标签（含标签名/图片标题模糊）=====
@@ -576,6 +688,46 @@ def popular_tags():
     """
     rows = query(sql, params)
     return jsonify([{"id": r["id"], "name": r["name"], "image_count": r["image_count"]} for r in rows])
+
+
+# ===== AI 推荐标签采纳 =====
+@bp.post("/api/images/<int:image_id>/tags/accept_suggestions")
+@jwt_required()
+def accept_suggested_tags(image_id: int):
+    """将 AI 推荐标签写入现有 tags / image_tags 表。"""
+    g.user_id = _current_user_id_from_jwt()
+    data = request.get_json(silent=True) or {}
+    tags = data.get("tags") or []
+    tags = [str(t).strip() for t in tags if str(t).strip()]
+    if not tags:
+        return jsonify({"error": "缺少 tags"}), 400
+
+    img_rows = query("SELECT id FROM images WHERE id=%s AND owner_id=%s LIMIT 1", (image_id, g.user_id))
+    if not img_rows:
+        return jsonify({"error": "图片不存在或无权限"}), 404
+
+    tag_ids = []
+    for name in tags:
+        existing = query("SELECT id FROM tags WHERE owner_id=%s AND name=%s LIMIT 1", (g.user_id, name))
+        if existing:
+            tag_ids.append(existing[0]["id"])
+        else:
+            tag_ids.append(execute("INSERT INTO tags (owner_id,name,kind) VALUES (%s,%s,%s)", (g.user_id, name, "user")))
+
+    if tag_ids:
+        pairs = [(image_id, tid) for tid in tag_ids]
+        executemany("INSERT IGNORE INTO image_tags (image_id,tag_id) VALUES (%s,%s)", pairs)
+
+    current = query(
+        """
+        SELECT t.name FROM image_tags it
+        JOIN tags t ON t.id = it.tag_id
+        WHERE it.image_id=%s
+        ORDER BY t.name
+        """,
+        (image_id,),
+    )
+    return jsonify({"ok": True, "tags": [r["name"] for r in current]})
 
 
 # ===== #advise 批量删除与批量加标签（仅操作数据，不改表结构）=====
@@ -731,11 +883,13 @@ def batch_download_images():
 @jwt_required()
 def image_detail(image_id: int):
     g.user_id = _current_user_id_from_jwt()
+    visibility_sql = ", i.visibility" if _has_visibility_column() else ""
     row = query(
-        """
+        f"""
         SELECT i.id, i.title, i.description, i.stored_path, i.path, i.parent_id,
                i.mime_type, COALESCE(i.size_bytes, i.size) AS size_bytes,
-               i.width, i.height, i.created_at, i.taken_at,
+               i.width, i.height, i.created_at, i.updated_at, i.taken_at
+               {visibility_sql},
                e.camera_make, e.camera_model, e.f_number, e.exposure_time,
                e.iso, e.focal_length, e.gps_lat, e.gps_lng, e.taken_at AS exif_taken_at
         FROM images i
@@ -800,12 +954,14 @@ def image_detail(image_id: int):
         "id": img["id"],
         "title": img.get("title"),
         "description": img.get("description"),
+        "visibility": img.get("visibility") if _has_visibility_column() else None,
         "url": url,
         "width": img.get("width"),
         "height": img.get("height"),
         "sizeMB": round((img.get("size_bytes") or 0) / 1024 / 1024, 1) if img.get("size_bytes") is not None else None,
         "format": (img.get("mime_type") or "").split("/")[-1].upper() if img.get("mime_type") else None,
         "createdAt": img.get("created_at").strftime("%Y-%m-%d %H:%M:%S") if img.get("created_at") else None,
+        "updatedAt": img.get("updated_at").strftime("%Y-%m-%d %H:%M:%S") if img.get("updated_at") else None,
         "takenAt": img.get("taken_at").strftime("%Y-%m-%d %H:%M:%S") if img.get("taken_at") else None,
         "tags": tags,
         "exif": exif,
@@ -814,9 +970,154 @@ def image_detail(image_id: int):
     return jsonify(resp)
 
 
+@bp.put("/api/images/<int:image_id>")
+@jwt_required()
+def update_image_meta(image_id: int):
+    g.user_id = _current_user_id_from_jwt()
+    data = request.get_json(silent=True) or {}
+
+    fields = []
+    params = []
+    if "title" in data:
+        fields.append("title=%s")
+        params.append((data.get("title") or "").strip() or None)
+    if "description" in data:
+        fields.append("description=%s")
+        params.append((data.get("description") or "").strip() or None)
+    if "visibility" in data and _has_visibility_column():
+        fields.append("visibility=%s")
+        params.append((data.get("visibility") or "").strip() or None)
+
+    if not fields:
+        return jsonify({"error": "缺少可更新字段"}), 400
+
+    fields.append("updated_at=NOW()")
+    params.extend([image_id, g.user_id or 0])
+    execute(
+        f"UPDATE images SET {', '.join(fields)} WHERE id=%s AND owner_id=%s",
+        params,
+    )
+
+    visibility_sql = ", visibility" if _has_visibility_column() else ""
+    rows = query(
+        f"""
+        SELECT title, description, updated_at{visibility_sql}
+        FROM images
+        WHERE id=%s AND owner_id=%s
+        LIMIT 1
+        """,
+        (image_id, g.user_id or 0),
+    )
+    if not rows:
+        return jsonify({"error": "图片不存在或无权限查看"}), 404
+    row = rows[0]
+    resp = {
+        "title": row.get("title"),
+        "description": row.get("description"),
+        "updatedAt": row.get("updated_at").strftime("%Y-%m-%d %H:%M:%S") if row.get("updated_at") else None,
+    }
+    if _has_visibility_column():
+        resp["visibility"] = row.get("visibility")
+    return jsonify({"ok": True, "image": resp})
+
+
+def _dedup_tags(tags, limit: int = 5):
+    seen = set()
+    result = []
+    for t in tags or []:
+        name = str(t).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+        if len(result) >= limit:
+            break
+    return result
+
+
+@bp.post("/api/images/<int:image_id>/ai_tags")
+@jwt_required()
+def image_ai_tags(image_id: int):
+    g.user_id = _current_user_id_from_jwt()
+    row = query(
+        "SELECT id, stored_path, path, title, width, height FROM images WHERE id=%s AND owner_id=%s LIMIT 1",
+        (image_id, g.user_id or 0),
+    )
+    if not row:
+        return jsonify({"error": "图片不存在或无权限查看"}), 404
+    img_row = row[0]
+    rel_path = (img_row.get("stored_path") or img_row.get("path") or "").strip()
+    if not rel_path:
+        return jsonify({"error": "图片路径缺失"}), 400
+
+    abs_root = os.path.abspath(current_app.config["UPLOAD_DIR"])
+    abs_path = os.path.join(abs_root, rel_path)
+    if not os.path.exists(abs_path):
+        return jsonify({"error": "图片文件不存在"}), 404
+
+    tags = []
+    try:
+        result = analyze_image(abs_path)
+        tags = result.get("tags") or []
+    except Exception:
+        tags = []
+
+    if not tags:
+        fallback = []
+        base_name = os.path.splitext(os.path.basename(rel_path))[0]
+        if base_name:
+            fallback.extend([t for t in base_name.replace("_", " ").replace("-", " ").split() if t])
+        width = img_row.get("width")
+        height = img_row.get("height")
+        if width and height:
+            fallback.append(f"{width}x{height}")
+            fallback.append("横图" if width >= height else "竖图")
+        try:
+            meta = extract_exif(abs_path)
+            fallback.extend(meta.get("auto_tags") or [])
+        except Exception:
+            pass
+        tags = _dedup_tags(fallback)
+    else:
+        tags = _dedup_tags(tags)
+
+    return jsonify({"tags": tags})
+
+
 # 简易图像处理：裁剪、旋转、亮度/对比度/饱和度/色温/锐化/缩放
 def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
-    # 1) 裁剪：安全取值防止越界
+    def _to_float(val):
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    def _to_int(val):
+        try:
+            return int(val)
+        except Exception:
+            return None
+
+    def _to_bool(val) -> bool:
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "y", "on")
+        return False
+
+    resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+
+    # 1) 旋转（像素级旋转，白底填充）
+    deg_f = _to_float(params.get("rotate")) or 0
+    if deg_f % 360 != 0:
+        try:
+            img = img.rotate(-deg_f, expand=True, fillcolor="white")
+        except TypeError:
+            img = img.rotate(-deg_f, expand=True)
+
+    # 2) 裁剪（基于旋转后的像素）
     crop_rect = params.get("crop_rect")
     if crop_rect and all(k in crop_rect for k in ("x", "y", "width", "height")):
         try:
@@ -833,15 +1134,6 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
                     img = img.crop((x, y, x2, y2))
         except Exception:
             pass  # 裁剪异常时忽略
-
-    # 2) 旋转
-    deg = params.get("rotate") or 0
-    try:
-        deg_f = float(deg)
-        if deg_f % 360 != 0:
-            img = img.rotate(-deg_f, expand=True)  # PIL 顺时针需要取负角度
-    except Exception:
-        pass
 
     # 3) 亮度/对比度/饱和度/色温/锐化
     def _factor(val):
@@ -860,77 +1152,119 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
     if s != 1:
         img = ImageEnhance.Color(img).enhance(s)
 
-    warm = params.get("warmth", 0)
-    try:
-        warm_v = float(warm)
-        if warm_v != 0 and img.mode == "RGB":
-            r, g_, b_ = img.split()
-            if warm_v > 0:
-                r = ImageEnhance.Brightness(r).enhance(1 + warm_v / 200)
-            else:
-                b_ = ImageEnhance.Brightness(b_).enhance(1 + abs(warm_v) / 200)
-            img = Image.merge("RGB", (r, g_, b_))
-    except Exception:
-        pass
+    warm_v = _to_float(params.get("warmth")) or 0
+    if warm_v != 0 and img.mode == "RGB":
+        warm_v = max(-100.0, min(100.0, warm_v))
+        strength = abs(warm_v) / 100.0
+        boost = 1 + strength * 0.6
+        reduce = 1 - strength * 0.3
+        r_gain = boost if warm_v > 0 else reduce
+        b_gain = boost if warm_v < 0 else reduce
+        r, g_, b_ = img.split()
+        r = r.point(lambda v: max(0, min(255, int(v * r_gain))))
+        b_ = b_.point(lambda v: max(0, min(255, int(v * b_gain))))
+        img = Image.merge("RGB", (r, g_, b_))
 
-    sharp = params.get("sharpen", 0)
-    try:
-        sharp_v = float(sharp)
-        if sharp_v > 0:
-            img = ImageEnhance.Sharpness(img).enhance(1 + sharp_v / 50)
-    except Exception:
-        pass
+    sharp_v = _to_float(params.get("sharpen")) or 0
+    if sharp_v > 0:
+        sharp_v = max(0.0, min(100.0, sharp_v))
+        scale = sharp_v / 100.0
+        radius = 1.2 + scale * 1.3
+        percent = int(100 + scale * 300)
+        img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=3))
 
-    # 4) 缩放：支持保持比例 keep_ratio 或目标尺寸
-    tw = params.get("target_width")
-    th = params.get("target_height")
-    keep_ratio = params.get("keep_ratio", False)
-    ratio_w = params.get("ratio_width")
-    ratio_h = params.get("ratio_height")
-
-    try:
-        tw = int(tw) if tw not in (None, "", False) else None
-        th = int(th) if th not in (None, "", False) else None
-        ratio_w = float(ratio_w) if ratio_w not in (None, "", False) else None
-        ratio_h = float(ratio_h) if ratio_h not in (None, "", False) else None
-    except Exception:
-        tw = th = ratio_w = ratio_h = None
+    # 4) 缩放：明确模式，默认避免 pad 造成“白底变了图不变”的误解
+    tw = _to_int(params.get("target_width"))
+    th = _to_int(params.get("target_height"))
+    keep_ratio = _to_bool(params.get("keep_ratio"))
+    resize_mode = (params.get("resize_mode") or "").strip().lower()
+    ratio_w = _to_float(params.get("ratio_width"))
+    ratio_h = _to_float(params.get("ratio_height"))
+    if tw is not None and tw <= 0:
+        tw = None
+    if th is not None and th <= 0:
+        th = None
 
     if tw or th:
         orig_w, orig_h = img.size
-        target_ratio = (ratio_w / ratio_h) if (keep_ratio and ratio_w and ratio_h and ratio_h != 0) else (orig_w / orig_h)
-
-        def _scale_for_bound(bound_w, bound_h):
-            """在给定边界内求缩放比"""
-            sw = bound_w / orig_w if bound_w else None
-            sh = bound_h / orig_h if bound_h else None
-            factors = [s for s in (sw, sh) if s]
-            scale = min(factors) if factors else 1.0
-            return max(scale, 0.01)
-
         if keep_ratio:
-            bound_w = tw or (th * target_ratio if th else orig_w)
-            bound_h = th or (tw / target_ratio if tw else orig_h)
-            scale = _scale_for_bound(bound_w, bound_h)
-            new_w = max(1, int(orig_w * scale))
-            new_h = max(1, int(orig_h * scale))
+            if ratio_w and ratio_h and ratio_h != 0:
+                if tw and not th:
+                    th = int(round(tw * (ratio_h / ratio_w)))
+                elif th and not tw:
+                    tw = int(round(th * (ratio_w / ratio_h)))
+                elif tw and th:
+                    th = int(round(tw * (ratio_h / ratio_w)))
+                else:
+                    tw = orig_w
+                    th = int(round(orig_w * (ratio_h / ratio_w)))
+            else:
+                if tw and not th:
+                    th = int(round(tw * (orig_h / orig_w)))
+                elif th and not tw:
+                    tw = int(round(th * (orig_w / orig_h)))
         else:
-            if tw and th:
-                scale = _scale_for_bound(tw, th)
-                new_w = max(1, int(orig_w * scale))
-                new_h = max(1, int(orig_h * scale))
-            elif tw:
-                new_w = max(1, tw)
-                new_h = max(1, int(orig_h * (new_w / orig_w)))
-            elif th:
-                new_h = max(1, th)
-                new_w = max(1, int(orig_w * (new_h / orig_h)))
-        try:
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-        except Exception:
-            pass  # 缩放异常时保持原图
+            if tw and not th:
+                th = orig_h
+            elif th and not tw:
+                tw = orig_w
+
+        tw = max(1, int(tw)) if tw else None
+        th = max(1, int(th)) if th else None
+        if tw and th:
+            try:
+                if not resize_mode:
+                    resize_mode = "fit" if keep_ratio else "stretch"
+                if resize_mode not in ("stretch", "fit", "pad"):
+                    resize_mode = "fit" if keep_ratio else "stretch"
+                if resize_mode == "pad":
+                    img = ImageOps.pad(img, (tw, th), method=resample, color="white")
+                elif resize_mode == "fit":
+                    img = ImageOps.fit(img, (tw, th), method=resample, centering=(0.5, 0.5))
+                else:
+                    img = img.resize((tw, th), resample=resample)
+            except Exception:
+                pass  # 缩放异常时保持原图
 
     return img
+
+
+# 预览渲染接口：前端 POST /api/images/<id>/preview
+@bp.post("/api/images/<int:image_id>/preview")
+@jwt_required()
+def preview_image(image_id: int):
+    g.user_id = _current_user_id_from_jwt()
+    data = request.get_json(silent=True) or {}
+
+    base_rows = query(
+        "SELECT id,owner_id,stored_path,path FROM images WHERE id=%s AND owner_id=%s LIMIT 1",
+        (image_id, g.user_id or 0),
+    )
+    if not base_rows:
+        return jsonify({"error": "图片不存在或无权限查看"}), 404
+    base = base_rows[0]
+    rel_path = (base.get("stored_path") or base.get("path") or "").strip()
+    if not rel_path:
+        return jsonify({"error": "原图路径缺失"}), 400
+
+    abs_root = os.path.abspath(current_app.config["UPLOAD_DIR"])
+    abs_in = os.path.join(abs_root, rel_path)
+    if not os.path.exists(abs_in):
+        return jsonify({"error": "原图文件不存在"}), 404
+
+    try:
+        with Image.open(abs_in) as img:
+            img = img.convert("RGB")
+            edited = _apply_edits(img, data)
+            buf = BytesIO()
+            edited.save(buf, format="JPEG", quality=90)
+            buf.seek(0)
+    except Exception as e:
+        return jsonify({"error": f"预览生成失败: {e}"}), 500
+
+    resp = send_file(buf, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # 裁剪/滤镜编辑接口：前端 POST /api/images/<id>/edit
@@ -1086,7 +1420,16 @@ def edit_image(image_id: int):
         ),
     )
 
-    return jsonify({"ok": True, "image_id": target_id, "url": f"/files/{rel_out}", "mode": mode})
+    resp = {"ok": True, "image_id": target_id, "url": f"/files/{rel_out}", "mode": mode}
+    stamp_row = query(
+        "SELECT updated_at, created_at FROM images WHERE id=%s AND owner_id=%s LIMIT 1",
+        (target_id, g.user_id or 0),
+    )
+    if stamp_row:
+        stamp = stamp_row[0].get("updated_at") or stamp_row[0].get("created_at")
+        if stamp:
+            resp["updatedAt"] = stamp.strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(resp)
 
 
 # ===== 标签列表（前端可用于筛选 & 上传时选择）=====
