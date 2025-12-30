@@ -68,7 +68,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="layout" :class="{ mobile: isMobile }">
+  <div class="layout" :class="{ mobile: isMobile, expanded: expanded && !isMobile, collapsed: !expanded && !isMobile }">
     <aside
       v-if="!isMobile"
       class="sidebar"
@@ -161,23 +161,27 @@ onBeforeUnmount(() => {
   --text-muted: var(--app-muted);
   --sidebar-collapsed: 72px;
   --sidebar-expanded: 240px;
+  --sidebar-w: var(--sidebar-collapsed);
   display: flex;
   min-height: 100vh;
   background: linear-gradient(180deg, #f7f9fc, #eef3fb);
-  padding-left: var(--sidebar-collapsed);
+}
+
+.layout.expanded {
+  --sidebar-w: var(--sidebar-expanded);
 }
 
 .layout.mobile {
-  padding-left: 0;
+  --sidebar-w: 0px;
   min-height: 100vh;
 }
 
 .sidebar {
-  position: fixed;
-  left: 0;
+  position: sticky;
   top: 0;
   height: 100vh;
-  width: var(--sidebar-collapsed);
+  width: var(--sidebar-w);
+  flex: 0 0 var(--sidebar-w);
   background: #f5f7ff;
   border-right: 1px solid var(--app-border);
   box-shadow: 4px 0 22px rgba(75, 140, 255, 0.08);
@@ -189,7 +193,6 @@ onBeforeUnmount(() => {
 }
 
 .sidebar.expanded {
-  width: var(--sidebar-expanded);
   box-shadow: 10px 0 32px rgba(75, 140, 255, 0.12);
 }
 
@@ -291,9 +294,10 @@ onBeforeUnmount(() => {
 .content {
   flex: 1;
   min-height: 100vh;
+  min-width: 0;
+  width: auto;
   background: #f4f7fb;
   overflow-y: auto;
-  width: 100%;
   display: flex;
   flex-direction: column;
 }
@@ -304,6 +308,11 @@ onBeforeUnmount(() => {
   padding: 18px 22px 28px;
   box-sizing: border-box;
   width: 100%;
+}
+
+.layout.collapsed .content-inner {
+  max-width: none;
+  margin: 0;
 }
 
 .sidebar-toggle {

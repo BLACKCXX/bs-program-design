@@ -9,7 +9,7 @@ import { ref, reactive, computed, onMounted, watch } from 'vue'
 import UploadDialog from '../components/UploadDialog.vue'
 import DateRangeInput from '../components/DateRangeInput.vue'
 import { ElMessage } from 'element-plus'
-import { Search, Upload, Download, Delete, PriceTag } from '@element-plus/icons-vue'
+import { Search, Upload, Download, Delete, PriceTag, StarFilled } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import api from '../api/http' // 预留：将来可从 /api/tags 获取真实标签
@@ -58,6 +58,8 @@ const items = ref([])
 const loadingList = ref(false) // #advise 列表加载态
 const tagOptions = ref([])
 const tagLoading = ref(false)
+const stats = reactive({ total: 0, today: 0 })
+const statsLoaded = ref(false)
 
 const formatDate = (val) => {
   if (!val) return ''
@@ -98,6 +100,18 @@ const loadImages = async () => {
     ElMessage.error(err?.response?.data?.error || 'Load images failed')
   } finally {
     loadingList.value = false
+  }
+}
+
+const loadStats = async () => {
+  try {
+    const { data } = await api.get('/api/images/stats')
+    stats.total = Number(data?.total ?? 0)
+    stats.today = Number(data?.today ?? 0)
+    statsLoaded.value = true
+  } catch (err) {
+    statsLoaded.value = false
+    console.error(err)
   }
 }
 
@@ -158,6 +172,20 @@ const displayItems = computed(() => {
   return arr
 })
 
+const featuredItems = computed(() => {
+  const list = [...displayItems.value]
+  if (!list.length) return []
+  const hasDate = list.some((it) => !Number.isNaN(Date.parse(it.date || '')))
+  if (hasDate) {
+    list.sort((a, b) => {
+      const ta = Date.parse(a.date || '')
+      const tb = Date.parse(b.date || '')
+      return (Number.isNaN(tb) ? 0 : tb) - (Number.isNaN(ta) ? 0 : ta)
+    })
+  }
+  return list.slice(0, 5)
+})
+
 const route = useRoute()
 const router = useRouter()
 const onLogout = () => {
@@ -172,6 +200,10 @@ const goDetail = (id) => {
 
 // #advise 批量模式：选中、工具条与退出
 const selectedCount = computed(() => selectedIds.value.length)
+const bulkButtonText = computed(() => (bulkMode.value ? '退出批量' : '批量操作'))
+const toggleBulkMode = () => {
+  bulkMode.value = !bulkMode.value
+}
 const toggleSelect = (id) => {
   const idx = selectedIds.value.indexOf(id)
   if (idx >= 0) selectedIds.value.splice(idx, 1)
@@ -255,10 +287,10 @@ watch(
   { deep: true }
 )
 
-onMounted(() => {
+onMounted(async () => {
   fetchPopularTags()
   loadFacets()
-  loadImages()
+  await Promise.all([loadImages(), loadStats()])
 })
 
 const resetFilters = () => {
@@ -273,7 +305,10 @@ const resetFilters = () => {
 
 const showUpload = ref(false)
 const onUploadClick = () => (showUpload.value = true)
-const onUploaded = async () => { await loadImages() }
+const onUploaded = async () => {
+  await loadImages()
+  await loadStats()
+}
 // 接收上传成功事件：演示模式下把新图片临时插入到最前（刷新后会消失，等接后端就改为拉取接口）
 /*const onUploaded = (payload) => {
   if (!payload?.files?.length) return
@@ -321,8 +356,22 @@ onMounted(fetchTags)*/
         />
       </div>
       <div class="right">
-        <div class="bulk"><span>批量模式</span><el-switch v-model="bulkMode" /></div>
-        <el-button type="primary" :icon="Upload" @click="onUploadClick">上传图片</el-button>
+        <div class="stats">
+          <div class="stat-pill">
+            <el-icon class="stat-icon"><StarFilled /></el-icon>
+            <div class="stat-text">
+              <span class="stat-label">图片总数</span>
+              <span class="stat-value">{{ statsLoaded ? stats.total : '--' }}</span>
+            </div>
+          </div>
+          <div class="stat-pill stat-accent">
+            <span class="stat-dot"></span>
+            <div class="stat-text">
+              <span class="stat-label">今日上传</span>
+              <span class="stat-value">{{ statsLoaded ? stats.today : '--' }}</span>
+            </div>
+          </div>
+        </div>
         <el-dropdown trigger="click">
             <span class="el-dropdown-link">
                 <el-avatar class="avatar" :size="36" :src="store?.user?.avatar_url || ''">
@@ -337,16 +386,6 @@ onMounted(fetchTags)*/
         </el-dropdown>
       </div>
     </header>
-
-    <div v-if="bulkMode" class="bulk-bar card">
-      <div class="bulk-info">已选择 {{ selectedCount }} 张图片</div>
-      <div class="bulk-actions">
-        <el-button :icon="Download" :disabled="!selectedCount" @click="downloadSelected">下载</el-button>
-        <el-button type="danger" :icon="Delete" :disabled="!selectedCount" @click="deleteSelected">删除</el-button>
-        <el-button type="primary" :icon="PriceTag" :disabled="!selectedCount" @click="openAddTagDialog">添加标签</el-button>
-      </div>
-      <el-button class="exit-bulk" @click="bulkMode = false">退出批量</el-button>
-    </div>
 
     <!-- 主体：左侧筛选 + 右侧网格 -->
     <section class="content">
@@ -417,11 +456,66 @@ onMounted(fetchTags)*/
 
       <!-- 右侧卡片网格 -->
       <main class="main">
+        <section class="featured-section">
+          <div class="featured-header">
+            <div class="featured-title">
+              <el-icon><StarFilled /></el-icon>
+              <span>精选轮播</span>
+            </div>
+            <div class="featured-sub">为你精选的最新记录</div>
+          </div>
+          <div class="featured-body">
+            <el-carousel
+              v-if="featuredItems.length"
+              class="featured-carousel"
+              height="280px"
+              :interval="5000"
+              :autoplay="true"
+              indicator-position="outside"
+              arrow="always"
+              pause-on-hover
+            >
+              <el-carousel-item v-for="item in featuredItems" :key="item.id">
+                <div
+                  class="featured-slide"
+                  :style="item.cover ? { backgroundImage: `url(${item.cover})` } : {}"
+                  @click="goDetail(item.id)"
+                >
+                  <div class="featured-overlay">
+                    <div class="featured-name">{{ item.title || '未命名' }}</div>
+                    <div class="featured-date">{{ item.date || '' }}</div>
+                  </div>
+                </div>
+              </el-carousel-item>
+            </el-carousel>
+            <div v-else class="featured-empty">
+              <el-empty description="暂无精选图片" />
+            </div>
+          </div>
+          <div class="action-bar">
+            <div class="action-left">
+              <el-button class="action-btn action-primary" :icon="Upload" @click="onUploadClick">上传图片</el-button>
+              <el-button
+                class="action-btn action-secondary"
+                :class="{ 'is-active': bulkMode }"
+                @click="toggleBulkMode"
+              >
+                {{ bulkButtonText }}
+              </el-button>
+            </div>
+            <div v-if="bulkMode" class="action-center">已选择 {{ selectedCount }} 张图片</div>
+            <div v-if="bulkMode" class="action-right">
+              <el-button class="bulk-btn" size="small" :icon="Download" :disabled="!selectedCount" @click="downloadSelected">下载</el-button>
+              <el-button class="bulk-btn bulk-btn-danger" size="small" :icon="Delete" :disabled="!selectedCount" @click="deleteSelected">删除</el-button>
+              <el-button class="bulk-btn bulk-btn-primary" size="small" :icon="PriceTag" :disabled="!selectedCount" @click="openAddTagDialog">添加标签</el-button>
+            </div>
+          </div>
+        </section>
         <div v-if="loadingList" class="empty">
           <el-empty description="加载中..." />
         </div>
         <div v-else-if="!displayItems.length" class="empty">
-          <el-empty description="暂无图片，试试右上角“上传图片”" />
+          <el-empty description="暂无图片，试试上方“上传图片”" />
         </div>
         <div v-else class="grid">
           <!-- 新增：卡片可点击跳转详情页 -->
@@ -481,13 +575,20 @@ onMounted(fetchTags)*/
 
 <style scoped>
 /* 背景与整体 */
-.page { min-height: 100vh; background: #f6f8fb; }
+.page {
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 12% -10%, rgba(96, 165, 250, 0.25), rgba(96, 165, 250, 0) 60%),
+    linear-gradient(180deg, #eaf2ff 0%, #f7fbff 45%, #f1f6ff 100%);
+  font-family: "HarmonyOS Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
 
 /* 顶部导航 */
 .nav {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; justify-content: space-between;
-  height: 64px; padding: 0 18px; background: #fff; border-bottom: 1px solid #eef0f3;
+  height: 64px; padding: 0 18px; background: rgba(255,255,255,0.95); border-bottom: 1px solid #eef0f3;
+  backdrop-filter: blur(8px);
 }
 .nav .left { display: flex; align-items: center; gap: 16px; flex: 1; min-width: 0; }
 .logo { display: flex; align-items: center; gap: 10px; min-width: 220px; }
@@ -498,13 +599,168 @@ onMounted(fetchTags)*/
 .logo-sub { font-size: 12px; color:#6b7280; }
 .search { max-width: 560px; width: 100%; }
 .nav .right { display:flex; align-items:center; gap: 14px; }
-.bulk { display:flex; align-items:center; gap: 8px; color:#4b5563; font-size: 14px; }
+.stats { display:flex; align-items:center; gap: 10px; flex-wrap: wrap; }
+.stat-pill {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 12px;
+  background: rgba(255,255,255,0.8);
+  border: 1px solid rgba(148, 197, 255, 0.6);
+  border-radius: 999px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8), 0 6px 14px rgba(59,130,246,0.12);
+}
+.stat-pill.stat-accent {
+  background: rgba(239,246,255,0.9);
+  border-color: rgba(147,197,253,0.7);
+}
+.stat-icon { color: #f59e0b; font-size: 16px; }
+.stat-text { display: flex; flex-direction: column; line-height: 1; }
+.stat-label { font-size: 12px; color: #5b6b82; }
+.stat-value { font-size: 16px; font-weight: 800; color: #1e3a8a; }
+.stat-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, #fef9c3, #facc15);
+  box-shadow: 0 0 0 2px rgba(250, 204, 21, 0.25);
+}
 .avatar { cursor: pointer; }
 
-.bulk-bar { display: flex; align-items: center; gap: 14px; margin: 8px 18px 0; }
-.bulk-info { font-weight: 700; color: #1f2937; }
-.bulk-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.exit-bulk { margin-left: auto; }
+/* 精选轮播 */
+.featured-section {
+  position: relative;
+  padding: 16px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, #f1f7ff 0%, #e8f1ff 45%, #ffffff 100%);
+  border: 1px solid rgba(148, 197, 255, 0.45);
+  box-shadow: 0 16px 30px rgba(30, 64, 175, 0.12);
+  overflow: hidden;
+}
+.featured-section::before {
+  content: "";
+  position: absolute;
+  right: -60px;
+  top: -80px;
+  width: 200px;
+  height: 200px;
+  background: radial-gradient(circle, rgba(59,130,246,0.25), rgba(59,130,246,0));
+  pointer-events: none;
+}
+.featured-section::after {
+  content: "";
+  position: absolute;
+  left: -80px;
+  bottom: -90px;
+  width: 220px;
+  height: 220px;
+  background: radial-gradient(circle, rgba(14,165,233,0.18), rgba(14,165,233,0));
+  pointer-events: none;
+}
+.featured-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px;
+  position: relative; z-index: 1;
+}
+.featured-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 18px; font-weight: 800; color: #1e3a8a;
+}
+.featured-title :deep(.el-icon) { color: #fbbf24; }
+.featured-sub { font-size: 13px; color: #6b7280; }
+.featured-body { position: relative; z-index: 1; }
+.featured-carousel {
+  border-radius: 16px;
+  overflow: hidden;
+  box-shadow: 0 12px 22px rgba(30, 64, 175, 0.15);
+}
+:deep(.featured-carousel .el-carousel__container) { border-radius: 16px; }
+:deep(.featured-carousel .el-carousel__arrow) {
+  background: rgba(255,255,255,0.9);
+  color: #1e3a8a;
+  box-shadow: 0 6px 14px rgba(30, 64, 175, 0.18);
+}
+:deep(.featured-carousel .el-carousel__indicator button) {
+  background: rgba(59,130,246,0.35);
+}
+:deep(.featured-carousel .el-carousel__indicator.is-active button) {
+  background: #3b82f6;
+}
+.featured-slide {
+  position: relative;
+  height: 100%;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #cfe2ff, #eef6ff);
+  background-size: cover;
+  background-position: center;
+  display: flex;
+  align-items: flex-end;
+  padding: 16px;
+  cursor: pointer;
+  overflow: hidden;
+}
+.featured-slide::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, rgba(15,23,42,0) 40%, rgba(15,23,42,0.65) 100%);
+}
+.featured-overlay { position: relative; z-index: 1; color: #fff; }
+.featured-name { font-size: 18px; font-weight: 700; margin-bottom: 4px; text-shadow: 0 2px 8px rgba(15,23,42,0.35); }
+.featured-date { font-size: 13px; opacity: 0.85; }
+.featured-empty {
+  padding: 28px 0;
+  border-radius: 14px;
+  background: rgba(255,255,255,0.7);
+}
+:deep(.featured-empty .el-empty__description) { color: #6b7280; }
+
+.action-bar {
+  position: relative; z-index: 1;
+  margin-top: 14px;
+  padding: 10px 12px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: rgba(255,255,255,0.7);
+  border: 1px solid rgba(148, 197, 255, 0.4);
+  border-radius: 14px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+.action-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.action-center { font-weight: 600; color: #1e3a8a; }
+.action-right { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+
+.action-btn {
+  --action-grad: linear-gradient(135deg, #60a5fa, #2563eb);
+  border-radius: 999px;
+  padding: 10px 18px;
+  font-weight: 700;
+  border: 1px solid rgba(255,255,255,0.45);
+  color: #fff;
+  background: var(--action-grad);
+  box-shadow: 0 10px 18px rgba(59,130,246,0.25), inset 0 1px 0 rgba(255,255,255,0.4);
+  transition: transform .15s ease, box-shadow .15s ease, filter .15s ease;
+}
+.action-btn.action-secondary { --action-grad: linear-gradient(135deg, #7dd3fc, #38bdf8); }
+.action-btn:hover { transform: translateY(-1px); box-shadow: 0 12px 22px rgba(59,130,246,0.28), inset 0 1px 0 rgba(255,255,255,0.5); }
+.action-btn:active { transform: translateY(1px); box-shadow: 0 6px 14px rgba(59,130,246,0.2), inset 0 1px 0 rgba(255,255,255,0.3); }
+.action-btn.is-active { filter: saturate(1.2); }
+:deep(.action-btn .el-icon) { font-size: 16px; }
+
+.bulk-btn {
+  border-radius: 10px;
+  border: 1px solid rgba(59,130,246,0.3);
+  background: linear-gradient(135deg, #eef6ff, #dbeafe);
+  color: #1e3a8a;
+  box-shadow: 0 6px 12px rgba(59,130,246,0.16);
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.bulk-btn-primary { background: linear-gradient(135deg, #dbeafe, #bfdbfe); }
+.bulk-btn-danger {
+  background: linear-gradient(135deg, #fee2e2, #fca5a5);
+  color: #b91c1c;
+  border-color: rgba(248,113,113,0.6);
+  box-shadow: 0 6px 12px rgba(248,113,113,0.18);
+}
+.bulk-btn:hover { transform: translateY(-1px); box-shadow: 0 8px 16px rgba(59,130,246,0.2); }
+.bulk-btn:active { transform: translateY(1px); }
+.bulk-btn.is-disabled { opacity: 0.6; box-shadow: none; }
+:deep(.bulk-btn .el-icon) { font-size: 14px; }
 
 /* 主体两栏 */
 .content { display: grid; grid-template-columns: 260px 1fr; gap: 16px; padding: 16px; }
@@ -523,7 +779,7 @@ onMounted(fetchTags)*/
 .empty-help { font-size: 13px; color:#9aa0a6; }
 
 /* 右侧网格与卡片 */
-.main { padding-right: 6px; }
+.main { padding-right: 6px; display: flex; flex-direction: column; gap: 16px; }
 .grid { display: grid; gap: 16px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 @media (min-width: 1400px) { .grid { grid-template-columns: repeat(4, 1fr); } }
 @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, 1fr); } }
@@ -542,6 +798,12 @@ onMounted(fetchTags)*/
 .meta { font-size: 13px; color:#9aa0a6; display:flex; gap:8px; align-items:center; }
 .card-checkbox { position: absolute; top: 10px; right: 10px; z-index: 2; background: rgba(255,255,255,0.8); border-radius: 8px; padding: 2px 4px; }
 .empty { margin-top: 8vh; }
+
+@media (max-width: 900px) {
+  .action-bar { align-items: flex-start; }
+  .action-right { width: 100%; margin-left: 0; justify-content: flex-end; }
+  .action-center { width: 100%; }
+}
 
 @media (max-width: 768px) {
   .nav {
@@ -566,10 +828,8 @@ onMounted(fetchTags)*/
     flex-wrap: wrap;
   }
 
-  .bulk-bar {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
+  .stats {
+    width: 100%;
   }
 
   .content {
@@ -578,6 +838,10 @@ onMounted(fetchTags)*/
 
   .grid {
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  }
+
+  :deep(.featured-carousel .el-carousel__container) {
+    height: 210px !important;
   }
 }
 </style>

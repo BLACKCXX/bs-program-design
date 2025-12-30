@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import datetime
 from io import BytesIO
@@ -188,12 +189,19 @@ def ai_analyze_image():
         fs.save(temp_path)
 
         result = analyze_image(temp_path)
+        tags_raw = result.get("tags") or []
+        if isinstance(tags_raw, str):
+            tags = [t.strip() for t in re.split(r"[，,、\s]+", tags_raw) if t.strip()]
+        elif isinstance(tags_raw, (list, tuple)):
+            tags = [str(t).strip() for t in tags_raw if str(t).strip()]
+        else:
+            tags = []
         return jsonify(
             {
                 "ok": True,
                 "title": result.get("title") or "",
                 "description": result.get("description") or "",
-                "tags": result.get("tags") or [],
+                "tags": tags,
             }
         )
     except Exception as exc:
@@ -476,6 +484,28 @@ def list_images():
         }
 
     return jsonify({"items": [fmt(r) for r in rows]})
+
+
+@bp.get("/api/images/stats")
+@jwt_required()
+def image_stats():
+    g.user_id = _current_user_id_from_jwt()
+    try:
+        rows = query(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN DATE(created_at)=CURDATE() THEN 1 ELSE 0 END) AS today
+            FROM images
+            WHERE owner_id=%s
+            """,
+            (g.user_id,),
+        )
+        row = rows[0] if rows else {}
+        total = int(row.get("total") or 0)
+        today = int(row.get("today") or 0)
+        return jsonify({"total": total, "today": today})
+    except Exception as exc:
+        return jsonify({"error": "统计失败", "detail": str(exc)}), 500
 
 
 @bp.get("/api/images/search")

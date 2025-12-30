@@ -2,6 +2,8 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api/http'
 
+export const AI_FILL_LABEL = 'AI 一键补全'
+
 // 使用 AI 自动生成标题 / 描述 / 标签
 export function useAiAnalyzer({ form, fileList, mergeTags }) {
   const analyzing = ref(false)

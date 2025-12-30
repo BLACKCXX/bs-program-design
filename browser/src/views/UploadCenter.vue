@@ -1,14 +1,11 @@
-<script setup>
-import { nextTick, ref, reactive, computed } from 'vue'
+﻿<script setup>
+import { nextTick, ref, computed } from 'vue'
 import { useRouter, isNavigationFailure, NavigationFailureType } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { UploadFilled } from '@element-plus/icons-vue'
+import { UploadFilled, Plus, Loading } from '@element-plus/icons-vue'
 import api from '../api/http'
-import { useAiAnalyzer } from '../utils/useAiAnalyzer'
+import { AI_FILL_LABEL } from '../utils/useAiAnalyzer'
 
-const form = reactive({ title: '', description: '', tags: [] })
-const fileList = ref([])
-const uploadQueue = ref([])
 const router = useRouter()
 
 const accept = '.jpg,.jpeg,.png,.gif,.webp'
@@ -16,88 +13,451 @@ const MAX_SIZE = 10 * 1024 * 1024
 const defaultTags = ['风景', '人物', '美食', '建筑', '动物', '艺术', '科技', '旅行', '自然']
 const tagOptions = computed(() => defaultTags)
 
-function beforeUpload(file) {
+const uploadRef = ref(null)
+const fileInputRef = ref(null)
+const folderInputRef = ref(null)
+const descRef = ref(null)
+const tagsRef = ref(null)
+
+const pendingFiles = ref([])
+const selectedIndex = ref(0)
+const dragging = ref(false)
+const uploading = ref(false)
+const analyzingActive = ref(false)
+const aiProcessing = ref(false)
+const incompleteDialogVisible = ref(false)
+const missingIndices = ref([])
+
+const selectedItem = computed(() => pendingFiles.value[selectedIndex.value] || null)
+const selectedMeta = computed(() => selectedItem.value?.meta || {})
+const selectedExif = computed(() => selectedMeta.value?.exif || {})
+const missingCount = computed(() => missingIndices.value.length)
+const titlePlaceholder = computed(() => {
+  const name = selectedItem.value?.file?.name
+  return name ? `默认使用文件名：${name}` : '输入标题'
+})
+
+const gpsAvailable = computed(() => !!selectedExif.value?.gps)
+const gpsVisible = computed(() => !!selectedMeta.value?.gpsVisible)
+const gpsButtonText = computed(() => (gpsVisible.value ? '隐藏位置' : '显示位置'))
+const gpsText = computed(() => {
+  if (!gpsAvailable.value) return '无 GPS 信息'
+  if (!gpsVisible.value) return '为保护隐私，GPS 位置信息默认隐藏'
+  const gps = selectedExif.value.gps
+  if (!gps) return '无 GPS 信息'
+  const lat = typeof gps.lat === 'number' ? gps.lat.toFixed(5) : gps.lat
+  const lng = typeof gps.lng === 'number' ? gps.lng.toFixed(5) : gps.lng
+  return `${lat}, ${lng}`
+})
+
+const displayResolution = computed(() => {
+  const width = selectedMeta.value?.width
+  const height = selectedMeta.value?.height
+  return width && height ? `${width} x ${height}` : '--'
+})
+const displaySize = computed(() => {
+  const sizeMB = selectedMeta.value?.sizeMB
+  return typeof sizeMB === 'number' ? `${sizeMB.toFixed(2)} MB` : '--'
+})
+const displayFormat = computed(() => selectedMeta.value?.format || '--')
+const displayCreatedAt = computed(() => selectedMeta.value?.createdAt || '--')
+const displayCamera = computed(() => selectedExif.value?.camera || '--')
+const displayLens = computed(() => selectedExif.value?.lens || '--')
+const displayFocal = computed(() => selectedExif.value?.focalLength || '--')
+const displayAperture = computed(() => selectedExif.value?.aperture || '--')
+const displayShutter = computed(() => selectedExif.value?.shutter || '--')
+const displayIso = computed(() => selectedExif.value?.iso || '--')
+const displayExifTime = computed(() => selectedExif.value?.datetime || '--')
+
+const genId = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID()
+  }
+  return `u_${Date.now()}_${Math.random().toString(16).slice(2)}`
+}
+
+const revokeUrl = (url) => {
+  try {
+    url && URL.revokeObjectURL(url)
+  } catch (e) {}
+}
+
+const validateFile = (file, silent = false) => {
   const okType = /image\/(jpeg|png|gif|webp)/i.test(file.type) || /\.(jpe?g|png|gif|webp)$/i.test(file.name)
-  if (!okType) { ElMessage.error('仅支持 JPG/PNG/GIF/WEBP 格式'); return false }
-  if (file.size > MAX_SIZE) { ElMessage.error('单个文件不能超过 10MB'); return false }
+  if (!okType) {
+    if (!silent) ElMessage.error('仅支持 JPG/PNG/GIF/WEBP 格式')
+    return false
+  }
+  if (file.size > MAX_SIZE) {
+    if (!silent) ElMessage.error('单个文件不能超过 10MB')
+    return false
+  }
   return true
 }
 
-const revokePreview = (url) => { try { url && URL.revokeObjectURL(url) } catch (e) {} }
-const syncQueue = (files = []) => {
-  const existing = new Map(uploadQueue.value.map((q) => [q.uid, q]))
-  const next = files.map((f) => {
-    const prev = existing.get(f.uid)
-    const preview = prev?.preview || (f.raw ? URL.createObjectURL(f.raw) : (f.url || ''))
-    return {
-      uid: f.uid,
-      name: f.name,
-      size: f.size,
-      status: f.status || prev?.status || 'ready',
-      preview,
-      serverUrl: prev?.serverUrl || f.url || '',
-      imageId: prev?.imageId || f.imageId || null,
-      duplicated: prev?.duplicated || f.duplicated || false,
+const formatSizeMB = (size) => Number((size / 1024 / 1024).toFixed(2))
+
+const formatFormat = (file) => {
+  const type = file.type?.split('/')?.[1]
+  if (type) return type.toUpperCase()
+  const ext = file.name?.split('.')?.pop()
+  return ext ? ext.toUpperCase() : '--'
+}
+
+const formatDate = (value) => {
+  if (!value) return '--'
+  const dt = new Date(value)
+  if (Number.isNaN(dt.getTime())) return '--'
+  return dt.toLocaleString()
+}
+
+const formatAperture = (value) => {
+  if (value === undefined || value === null || value === '') return ''
+  const num = Number(value)
+  if (!Number.isNaN(num)) return `f/${num.toFixed(1)}`
+  return `f/${value}`
+}
+
+const formatShutter = (value) => {
+  if (value === undefined || value === null || value === '') return ''
+  if (typeof value === 'number') {
+    if (value >= 1) return `${value.toFixed(1)}s`
+    const denom = Math.round(1 / value)
+    return `1/${denom}s`
+  }
+  if (typeof value === 'string') return value
+  if (value?.numerator && value?.denominator) return `${value.numerator}/${value.denominator}s`
+  return String(value)
+}
+
+const formatFocal = (value) => {
+  if (value === undefined || value === null || value === '') return ''
+  const num = Number(value)
+  if (!Number.isNaN(num)) return `${num.toFixed(0)}mm`
+  return String(value)
+}
+
+const formatExifDate = (value) => {
+  if (!value) return ''
+  if (value instanceof Date) return value.toLocaleString()
+  const dt = new Date(value)
+  if (!Number.isNaN(dt.getTime())) return dt.toLocaleString()
+  return String(value)
+}
+
+let exifrModule = null
+const loadExifr = async () => {
+  if (exifrModule) return exifrModule
+  try {
+    const mod = await import(
+      /* @vite-ignore */ 'https://cdn.jsdelivr.net/npm/exifr@7.1.3/dist/exifr.esm.js'
+    )
+    exifrModule = mod?.default || mod
+  } catch (e) {
+    exifrModule = null
+  }
+  return exifrModule
+}
+
+const buildItem = (file) => ({
+  id: genId(),
+  file,
+  url: URL.createObjectURL(file),
+  form: {
+    title: '',
+    description: '',
+    tags: [],
+    visibility: 'private',
+  },
+  meta: {
+    width: null,
+    height: null,
+    sizeMB: formatSizeMB(file.size),
+    format: formatFormat(file),
+    createdAt: formatDate(file.lastModified),
+    gpsVisible: false,
+    exif: {
+      camera: '',
+      lens: '',
+      focalLength: '',
+      aperture: '',
+      shutter: '',
+      iso: '',
+      datetime: '',
+      gps: null,
+    },
+  },
+  errors: {},
+  status: 'pending',
+  serverUrl: '',
+  imageId: null,
+  duplicated: false,
+})
+
+const loadImageSize = (item) =>
+  new Promise((resolve) => {
+    const img = new Image()
+    img.onload = () => {
+      item.meta.width = img.width
+      item.meta.height = img.height
+      resolve()
+    }
+    img.onerror = () => resolve()
+    img.src = item.url
+  })
+
+const hydrateMeta = async (item) => {
+  await loadImageSize(item)
+  try {
+    const exifr = await loadExifr()
+    if (!exifr?.parse) return
+    const data = await exifr.parse(item.file, {
+      pick: [
+        'Make',
+        'Model',
+        'LensMake',
+        'LensModel',
+        'FocalLength',
+        'FNumber',
+        'ExposureTime',
+        'ISO',
+        'DateTimeOriginal',
+        'CreateDate',
+        'ModifyDate',
+        'GPSLatitude',
+        'GPSLongitude',
+      ],
+    })
+    if (!data) return
+    const camera = [data.Make, data.Model].filter(Boolean).join(' ')
+    const lens = [data.LensMake, data.LensModel].filter(Boolean).join(' ')
+    const gps =
+      typeof data.GPSLatitude === 'number' && typeof data.GPSLongitude === 'number'
+        ? { lat: data.GPSLatitude, lng: data.GPSLongitude }
+        : null
+    item.meta.exif = {
+      camera,
+      lens,
+      focalLength: formatFocal(data.FocalLength),
+      aperture: formatAperture(data.FNumber),
+      shutter: formatShutter(data.ExposureTime),
+      iso: data.ISO ? String(data.ISO) : '',
+      datetime: formatExifDate(data.DateTimeOriginal || data.CreateDate || data.ModifyDate),
+      gps,
+    }
+  } catch (e) {
+    // 解析失败保持默认值
+  }
+}
+
+const addFiles = (files) => {
+  const list = Array.from(files || []).filter(Boolean)
+  if (!list.length) return
+  let added = 0
+  list.forEach((file) => {
+    if (!validateFile(file)) return
+    const item = buildItem(file)
+    pendingFiles.value.push(item)
+    added += 1
+    void hydrateMeta(item)
+  })
+  if (added) {
+    if (selectedIndex.value < 0 || selectedIndex.value >= pendingFiles.value.length) {
+      selectedIndex.value = 0
+    }
+    nextTick(() => uploadRef.value?.clearFiles())
+  }
+}
+
+const beforeUpload = (file) => validateFile(file, true)
+
+const handleUploadChange = (file) => {
+  if (file?.raw) addFiles([file.raw])
+}
+
+const onFilesPicked = (event) => {
+  addFiles(event.target.files)
+  event.target.value = ''
+}
+
+const onFolderPicked = (event) => {
+  addFiles(event.target.files)
+  event.target.value = ''
+}
+
+const onDrop = (event) => {
+  dragging.value = false
+  addFiles(event.dataTransfer?.files)
+}
+
+const onDragEnter = () => {
+  dragging.value = true
+}
+
+const onDragLeave = () => {
+  dragging.value = false
+}
+
+const setActive = (idx) => {
+  selectedIndex.value = idx
+}
+
+const removeItem = (idx) => {
+  const item = pendingFiles.value[idx]
+  if (!item) return
+  revokeUrl(item.url)
+  pendingFiles.value.splice(idx, 1)
+  if (!pendingFiles.value.length) {
+    selectedIndex.value = 0
+    return
+  }
+  if (selectedIndex.value >= pendingFiles.value.length) {
+    selectedIndex.value = pendingFiles.value.length - 1
+  }
+}
+
+const reset = () => {
+  pendingFiles.value.forEach((item) => revokeUrl(item.url))
+  pendingFiles.value = []
+  selectedIndex.value = 0
+  uploadRef.value?.clearFiles()
+}
+
+const clearFieldError = (field) => {
+  if (!selectedItem.value?.errors) return
+  if (field === 'description' && selectedItem.value.form.description.trim()) {
+    selectedItem.value.errors.description = false
+  }
+  if (field === 'tags' && selectedItem.value.form.tags.length) {
+    selectedItem.value.errors.tags = false
+  }
+}
+
+const validateItem = (item) => {
+  const errors = {}
+  if (!item.form.description.trim()) errors.description = true
+  if (!item.form.tags.length) errors.tags = true
+  item.errors = errors
+  return Object.keys(errors).length === 0
+}
+
+const validateQueue = () => {
+  const missing = []
+  pendingFiles.value.forEach((item, idx) => {
+    if (!validateItem(item)) missing.push(idx)
+  })
+  missingIndices.value = missing
+  return missing
+}
+
+const scrollToError = (item) => {
+  nextTick(() => {
+    if (item.errors?.description && descRef.value) {
+      descRef.value.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      return
+    }
+    if (item.errors?.tags && tagsRef.value) {
+      tagsRef.value.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
   })
-  existing.forEach((val, key) => {
-    if (!files.find((f) => f.uid === key)) revokePreview(val.preview)
-  })
-  uploadQueue.value = next
-}
-const onChange = (_file, files) => {
-  fileList.value = files
-  syncQueue(files)
-}
-const onRemove = (_file, files) => {
-  fileList.value = files
-  syncQueue(files)
 }
 
-const uploading = ref(false)
-const USE_MOCK = false
-
-function reset() {
-  form.title = ''
-  form.description = ''
-  form.tags = []
-  uploadQueue.value.forEach((q) => revokePreview(q.preview))
-  uploadQueue.value = []
-  fileList.value = []
+const goToFirstIncomplete = () => {
+  if (!missingIndices.value.length) {
+    incompleteDialogVisible.value = false
+    return
+  }
+  const idx = missingIndices.value[0]
+  selectedIndex.value = idx
+  const item = pendingFiles.value[idx]
+  incompleteDialogVisible.value = false
+  if (item) scrollToError(item)
 }
 
-// 合并标签并去重，保持已有选择
-function mergeTags(newTags = []) {
-  const incoming = Array.isArray(newTags) ? newTags : [newTags].filter(Boolean)
-  const merged = new Set(form.tags || [])
-  incoming.forEach((t) => {
-    const name = (t || '').toString().trim()
-    if (name) merged.add(name)
-  })
-  form.tags = Array.from(merged)
+const toggleGps = () => {
+  if (!selectedItem.value) return
+  selectedItem.value.meta.gpsVisible = !selectedItem.value.meta.gpsVisible
 }
 
-const { analyzing, analyze: analyzeByAI } = useAiAnalyzer({ form, fileList, mergeTags })
+const normalizeTags = (raw) => {
+  if (!raw) return []
+  if (Array.isArray(raw)) {
+    return raw.map((t) => String(t).trim()).filter(Boolean)
+  }
+  if (typeof raw === 'string') {
+    return raw
+      .split(/[，,、\s]+/)
+      .map((t) => t.trim())
+      .filter(Boolean)
+  }
+  return []
+}
 
-const updateQueueWithServer = (savedList = []) => {
-  const arr = Array.isArray(savedList) ? savedList : []
-  uploadQueue.value = uploadQueue.value.map((q, idx) => {
-    const resp = arr[idx] || {}
-    const serverUrl = resp.thumb_url || resp.url || q.serverUrl || q.preview
-    if (q.preview && serverUrl && serverUrl !== q.preview) revokePreview(q.preview)
-    return {
-      ...q,
-      serverUrl,
-      status: 'success',
-      imageId: resp.image_id || resp.id || q.imageId || null,
-      duplicated: !!resp.duplicated,
+const analyzeItem = async (item) => {
+  item.status = 'analyzing'
+  try {
+    const fd = new FormData()
+    fd.append('file', item.file)
+    const { data } = await api.post('/api/v1/images/ai-analyze', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+    if (data?.ok === false) {
+      throw new Error(data?.error || 'AI 分析失败')
     }
-  })
-  fileList.value = fileList.value.map((f, idx) => {
-    const resp = arr[idx] || {}
-    return { ...f, status: 'success', url: resp.thumb_url || resp.url || f.url, imageId: resp.image_id || resp.id }
-  })
-  return arr
+    const aiTitle = String(data?.title || '').trim()
+    const aiDesc = String(data?.description || '').trim()
+    const aiTags = normalizeTags(data?.tags || [])
+    if (!item.form.title && aiTitle) item.form.title = aiTitle
+    if (!item.form.description && aiDesc) item.form.description = aiDesc
+    if (!item.form.tags.length && aiTags.length) item.form.tags = aiTags
+    return true
+  } catch (e) {
+    ElMessage.error(e?.message || 'AI 分析失败')
+    return false
+  } finally {
+    item.status = 'pending'
+  }
+}
+
+const analyzeActive = async () => {
+  const item = selectedItem.value
+  if (!item) {
+    ElMessage.warning('请先选择图片')
+    return
+  }
+  if (!item.file) {
+    ElMessage.error('未找到图片源文件')
+    return
+  }
+  analyzingActive.value = true
+  const ok = await analyzeItem(item)
+  analyzingActive.value = false
+  if (ok) {
+    ElMessage.success('AI 已分析完成')
+  }
+}
+
+const autoFillIncomplete = async () => {
+  const missing = validateQueue()
+  if (!missing.length) {
+    incompleteDialogVisible.value = false
+    return
+  }
+  aiProcessing.value = true
+  for (const idx of missing) {
+    const item = pendingFiles.value[idx]
+    if (!item) continue
+    await analyzeItem(item)
+  }
+  aiProcessing.value = false
+  const left = validateQueue()
+  if (!left.length) {
+    incompleteDialogVisible.value = false
+    await performUpload()
+  } else {
+    ElMessage.warning(`还有 ${left.length} 张图片未完善，请继续设置`)
+    goToFirstIncomplete()
+  }
 }
 
 const safeNavigate = async (target) => {
@@ -110,43 +470,71 @@ const safeNavigate = async (target) => {
   }
 }
 
-const submit = async () => {
-  if (!fileList.value.length) {
+const applyUploadResult = (item, resp = {}) => {
+  const serverUrl = resp.thumb_url || resp.url || item.serverUrl || item.url
+  item.serverUrl = serverUrl
+  item.imageId = resp.image_id || resp.id || item.imageId || null
+  item.duplicated = !!resp.duplicated
+  item.status = 'done'
+}
+
+const uploadOne = async (item) => {
+  const fd = new FormData()
+  fd.append('files', item.file)
+  fd.append('title', item.form.title || '')
+  fd.append('description', item.form.description || '')
+  fd.append('tags', JSON.stringify(item.form.tags || []))
+  fd.append('visibility', item.form.visibility || 'private')
+  const { data } = await api.post('/api/upload', fd, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+  const saved = data?.saved || data?.files || []
+  return saved[0] || {}
+}
+
+const performUpload = async () => {
+  if (!pendingFiles.value.length) {
     ElMessage.warning('请选择要上传的图片')
     return
   }
   uploading.value = true
-  let savedList = []
-  try {
-    const fd = new FormData()
-    fileList.value.forEach((f) => fd.append('files', f.raw))
-    fd.append('title', form.title)
-    fd.append('description', form.description)
-    fd.append('tags', JSON.stringify(form.tags))
-
-    if (USE_MOCK) {
-      await new Promise((r) => setTimeout(r, 800))
-      savedList = uploadQueue.value.map((q) => ({ url: q.serverUrl || q.preview }))
-    } else {
-      const { data } = await api.post('/api/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
-      savedList = data?.saved || data?.files || []
+  let successCount = 0
+  for (const item of pendingFiles.value) {
+    item.status = 'uploading'
+    try {
+      const resp = await uploadOne(item)
+      applyUploadResult(item, resp)
+      successCount += 1
+    } catch (e) {
+      item.status = 'error'
+      ElMessage.error(e?.response?.data?.error || `上传失败：${item.file?.name || ''}`)
     }
-    const applied = updateQueueWithServer(savedList)
-    ElMessage.success('上传成功')
-    const ids = applied.map((it) => it?.image_id || it?.id).filter(Boolean)
-    const effectiveCount = Math.max(applied.length || 0, uploadQueue.value.length || 0, fileList.value.length || 0)
-    uploading.value = false
+  }
+  uploading.value = false
+  if (successCount) {
+    ElMessage.success(`成功上传 ${successCount} 张图片`)
+    const ids = pendingFiles.value.map((q) => q.imageId).filter(Boolean)
     await nextTick()
-    if (effectiveCount === 1 && ids[0]) {
+    if (successCount === 1 && pendingFiles.value.length === 1 && ids[0]) {
       await safeNavigate({ name: 'ImageDetail', params: { id: ids[0] } })
     } else {
       await safeNavigate({ name: 'gallery', query: { from: 'upload', t: Date.now() } })
     }
-  } catch (e) {
-    ElMessage.error(e?.response?.data?.error || '上传失败')
-  } finally {
-    uploading.value = false
   }
+}
+
+const handleStartUpload = async () => {
+  if (uploading.value || analyzingActive.value || aiProcessing.value) return
+  if (!pendingFiles.value.length) {
+    ElMessage.warning('请选择要上传的图片')
+    return
+  }
+  const missing = validateQueue()
+  if (missing.length) {
+    incompleteDialogVisible.value = true
+    return
+  }
+  await performUpload()
 }
 </script>
 
@@ -155,98 +543,252 @@ const submit = async () => {
     <div class="header">
       <div>
         <h2>上传中心 · 快来丰富你的专属图库吧！</h2>
-        <p class="sub">支持多种图片格式，拖拽或点击选择，保持与你当前上传逻辑一致</p>
+        <p class="sub">支持拖拽或点击选择，批量编辑每张图片的元信息</p>
       </div>
       <el-tag type="success" effect="plain">使用现有上传接口</el-tag>
     </div>
 
-    <div class="card grid">
-      <div class="drop">
-        <div class="drop-inner">
-          <el-upload
-            class="upload-box"
-            drag
-            multiple
-            :auto-upload="false"
-            :file-list="fileList"
-            :before-upload="beforeUpload"
-            :on-change="onChange"
-            :on-remove="onRemove"
-            :accept="accept"
-          >
-            <div class="drag-area">
-              <el-icon class="icon"><UploadFilled /></el-icon>
-              <div class="msg">拖拽或轻点选择</div>
-              <div class="tips">支持 JPG / PNG / GIF / WEBP，单个文件不超过 10MB</div>
+    <div class="workspace">
+      <div class="preview-column">
+        <div
+          class="preview-panel"
+          :class="{ dragging }"
+          @dragenter.prevent="onDragEnter"
+          @dragover.prevent
+          @dragleave.prevent="onDragLeave"
+          @drop.prevent="onDrop"
+        >
+          <div v-if="!pendingFiles.length" class="preview-empty">
+            <el-upload
+              ref="uploadRef"
+              class="upload-box"
+              drag
+              multiple
+              :auto-upload="false"
+              :show-file-list="false"
+              :before-upload="beforeUpload"
+              :on-change="handleUploadChange"
+              :accept="accept"
+            >
+              <div class="drag-area">
+                <el-icon class="icon"><UploadFilled /></el-icon>
+                <div class="msg">拖拽或轻点选择</div>
+                <div class="tips">支持 JPG / PNG / GIF / WEBP，单个文件不超过 10MB</div>
+              </div>
+            </el-upload>
+            <div class="helper">手机可直接拍照或从相册选择，支持批量拖入</div>
+          </div>
+          <div v-else class="preview-stage">
+            <img v-if="selectedItem?.url" class="preview-image" :src="selectedItem.url" alt="preview" />
+            <div v-else class="preview-placeholder">暂无预览</div>
+            <div v-if="selectedItem?.status === 'analyzing'" class="preview-status">
+              <el-icon class="spin"><Loading /></el-icon>
+              AI 分析中...
             </div>
-          </el-upload>
-          <div class="helper">
-            手机可直接拍照或从相册选择，支持批量拖入
+          </div>
+          <div v-if="dragging" class="drop-mask">释放鼠标以添加图片</div>
+        </div>
+
+        <div class="add-more">
+          <el-dropdown trigger="click">
+            <el-button class="add-btn" type="primary" plain>
+              <el-icon><Plus /></el-icon>
+              继续添加图片
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item @click="fileInputRef?.click()">选择文件</el-dropdown-item>
+                <el-dropdown-item @click="folderInputRef?.click()">选择文件夹</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <input
+            ref="fileInputRef"
+            class="hidden-input"
+            type="file"
+            multiple
+            :accept="accept"
+            @change="onFilesPicked"
+          />
+          <input
+            ref="folderInputRef"
+            class="hidden-input"
+            type="file"
+            multiple
+            webkitdirectory
+            @change="onFolderPicked"
+          />
+          <span class="add-tip">支持拖拽追加与文件夹批量导入</span>
+        </div>
+
+        <div v-if="pendingFiles.length" class="thumb-strip">
+          <div
+            v-for="(item, idx) in pendingFiles"
+            :key="item.id"
+            class="thumb-card"
+            :class="{ active: idx === selectedIndex, busy: item.status === 'analyzing' || item.status === 'uploading' }"
+            @click="setActive(idx)"
+          >
+            <div
+              class="thumb-image"
+              :style="item.url || item.serverUrl ? { backgroundImage: `url(${item.serverUrl || item.url})` } : {}"
+            ></div>
+            <div class="thumb-info">
+              <div class="thumb-name">{{ item.file?.name || '--' }}</div>
+              <div class="thumb-meta">
+                {{ item.meta?.sizeMB ? `${item.meta.sizeMB.toFixed(2)} MB` : '--' }}
+              </div>
+            </div>
+            <div v-if="item.status === 'analyzing'" class="thumb-state">AI</div>
+            <div v-else-if="item.status === 'uploading'" class="thumb-state">上传中</div>
+            <div v-else-if="item.status === 'done'" class="thumb-state done">完成</div>
+            <div v-else-if="item.status === 'error'" class="thumb-state error">失败</div>
+            <button class="thumb-remove" type="button" @click.stop="removeItem(idx)">×</button>
           </div>
         </div>
       </div>
 
-      <div class="form">
+      <div class="form-column">
         <div class="form-title">上传设置</div>
         <el-form label-position="top" class="form-body">
-          <el-form-item label="自定义名称">
-            <el-input v-model="form.title" placeholder="如：美丽的樱花（为空则用文件名）" />
-          </el-form-item>
-          <el-form-item label="描述">
-            <el-input
-              v-model="form.description"
-              type="textarea"
-              :rows="3"
-              placeholder="可用于图片指引，支持多行"
-            />
-          </el-form-item>
-          <el-form-item label="标签">
-            <el-select
-              v-model="form.tags"
-              multiple
-              filterable
-              allow-create
-              default-first-option
-              collapse-tags
-              :max-collapse-tags="4"
-              :reserve-keyword="false"
-              placeholder="输入或选择标签"
-            >
-              <el-option v-for="t in tagOptions" :key="t" :label="t" :value="t" />
-            </el-select>
-          </el-form-item>
+          <template v-if="selectedItem">
+            <el-form-item label="标题">
+              <el-input v-model="selectedItem.form.title" :placeholder="titlePlaceholder" />
+            </el-form-item>
+            <div ref="descRef">
+              <el-form-item label="描述">
+                <el-input
+                  v-model="selectedItem.form.description"
+                  type="textarea"
+                  :rows="3"
+                  placeholder="可用于图片指引，支持多行"
+                  @input="clearFieldError('description')"
+                />
+                <div v-if="selectedItem.errors?.description" class="field-error">请填写简介</div>
+              </el-form-item>
+            </div>
+            <div ref="tagsRef">
+              <el-form-item label="标签">
+                <el-select
+                  v-model="selectedItem.form.tags"
+                  multiple
+                  filterable
+                  allow-create
+                  default-first-option
+                  collapse-tags
+                  :max-collapse-tags="4"
+                  :reserve-keyword="false"
+                  placeholder="输入或选择标签"
+                  @change="clearFieldError('tags')"
+                >
+                  <el-option v-for="t in tagOptions" :key="t" :label="t" :value="t" />
+                </el-select>
+                <div v-if="selectedItem.errors?.tags" class="field-error">请至少添加一个标签</div>
+              </el-form-item>
+            </div>
+            <el-form-item label="可见性">
+              <el-select v-model="selectedItem.form.visibility" placeholder="选择可见性">
+                <el-option label="仅自己可见" value="private" />
+                <el-option label="公开" value="public" />
+              </el-select>
+            </el-form-item>
+            <div class="meta-card">
+              <div class="meta-title">预览信息（文件/EXIF）</div>
+              <div class="meta-grid">
+                <div class="meta-item">
+                  <span>尺寸(px)</span>
+                  <strong>{{ displayResolution }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>大小</span>
+                  <strong>{{ displaySize }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>格式</span>
+                  <strong>{{ displayFormat }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>创建时间</span>
+                  <strong>{{ displayCreatedAt }}</strong>
+                </div>
+              </div>
+              <div class="meta-divider"></div>
+              <div class="meta-grid">
+                <div class="meta-item">
+                  <span>相机</span>
+                  <strong>{{ displayCamera }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>镜头</span>
+                  <strong>{{ displayLens }}</strong>
+                </div>
+              </div>
+              <div class="meta-divider"></div>
+              <div class="meta-grid">
+                <div class="meta-item">
+                  <span>焦距</span>
+                  <strong>{{ displayFocal }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>光圈</span>
+                  <strong>{{ displayAperture }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>快门</span>
+                  <strong>{{ displayShutter }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>ISO</span>
+                  <strong>{{ displayIso }}</strong>
+                </div>
+                <div class="meta-item">
+                  <span>拍摄时间</span>
+                  <strong>{{ displayExifTime }}</strong>
+                </div>
+              </div>
+              <div class="meta-divider"></div>
+              <div class="meta-gps">
+                <div class="meta-gps-text">{{ gpsText }}</div>
+                <el-button size="small" :disabled="!gpsAvailable" @click="toggleGps">
+                  {{ gpsButtonText }}
+                </el-button>
+              </div>
+            </div>
+          </template>
+          <div v-else class="empty-form">先选择图片，再完善元信息</div>
         </el-form>
         <div class="actions">
-          <el-button @click="reset">清空选择</el-button>
+          <el-button @click="reset" :disabled="uploading || aiProcessing">清空选择</el-button>
           <el-button
+            class="glossy-btn"
             type="primary"
             plain
-            :disabled="!fileList.length || uploading || analyzing"
-            :loading="analyzing"
-            @click="analyzeByAI"
+            :disabled="!selectedItem || uploading || aiProcessing || analyzingActive"
+            :loading="analyzingActive"
+            @click="analyzeActive"
           >
             AI 智能分析
           </el-button>
-          <el-button type="primary" :loading="uploading" :disabled="!fileList.length || analyzing" @click="submit">
+          <el-button
+            class="glossy-btn"
+            type="primary"
+            :loading="uploading"
+            :disabled="!pendingFiles.length || analyzingActive || aiProcessing"
+            @click="handleStartUpload"
+          >
             开始上传
           </el-button>
         </div>
       </div>
     </div>
 
-    <div class="card queue">
-      <div class="queue-title">上传队列</div>
-      <div v-if="!uploadQueue.length" class="empty">暂时还没有待上传的图片～ 先从上面选择几张吧 💗</div>
-      <div v-else class="queue-list">
-        <div v-for="file in uploadQueue" :key="file.uid" class="queue-item">
-          <div class="thumb" :style="file.serverUrl || file.preview ? { backgroundImage: `url(${file.serverUrl || file.preview})` } : {}"></div>
-          <div class="queue-info">
-            <div class="name">{{ file.name }}</div>
-            <div class="meta">{{ (file.size / 1024 / 1024).toFixed(1) }} MB</div>
-          </div>
-        </div>
-      </div>
-    </div>
+    <el-dialog v-model="incompleteDialogVisible" title="信息尚未完善" width="420px">
+      <div class="dialog-body">还有 {{ missingCount }} 张图片未完善信息，可继续设置或使用 AI 智能分析补全。</div>
+      <template #footer>
+        <el-button @click="goToFirstIncomplete">继续设置</el-button>
+        <el-button type="primary" :loading="aiProcessing" @click="autoFillIncomplete">{{ AI_FILL_LABEL }}</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -262,6 +804,12 @@ const submit = async () => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 0 18px 28px;
+  width: 100%;
+  box-sizing: border-box;
+  overflow-x: hidden;
 }
 
 .header {
@@ -282,36 +830,95 @@ const submit = async () => {
   font-size: 14px;
 }
 
-.card {
-  background: #fff;
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 14px;
-  box-shadow: 0 12px 26px rgba(75, 140, 255, 0.08);
-}
-
-.grid {
+.workspace {
   display: grid;
-  grid-template-columns: 2fr 1fr;
-  gap: 14px;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 16px;
 }
 
-.drop {
-  background: #fff;
-  border-radius: 14px;
-  border: 1px dashed var(--border);
-  padding: 14px;
+.preview-column,
+.form-column {
+  min-width: 0;
 }
 
-.drop-inner {
-  background: linear-gradient(180deg, #f8fbff, #edf3ff);
-  border-radius: 12px;
-  border: 1px dashed var(--border);
-  padding: 18px;
-  height: 100%;
+.preview-column {
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
+  gap: 12px;
+}
+
+.preview-panel {
+  position: relative;
+  background: #fff;
+  border: 1px dashed var(--border);
+  border-radius: 16px;
+  padding: 14px;
+  min-height: 360px;
+  box-shadow: 0 12px 26px rgba(75, 140, 255, 0.08);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.preview-panel.dragging {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(75, 140, 255, 0.18);
+}
+
+.preview-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+}
+
+.preview-stage {
+  height: 420px;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #f8fbff, #edf3ff);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.preview-image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.preview-placeholder {
+  color: var(--muted);
+}
+
+.preview-status {
+  position: absolute;
+  right: 18px;
+  top: 18px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: var(--primary-strong);
+}
+
+.preview-status .spin {
+  animation: spin 1s linear infinite;
+}
+
+.drop-mask {
+  position: absolute;
+  inset: 0;
+  border-radius: 16px;
+  background: rgba(59, 130, 246, 0.08);
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  color: var(--primary-strong);
 }
 
 .drag-area {
@@ -347,11 +954,126 @@ const submit = async () => {
   text-align: center;
 }
 
-.form {
+.add-more {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.add-btn {
+  border-radius: 999px;
+  height: 32px;
+  padding: 0 14px;
+}
+
+.add-tip {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.hidden-input {
+  display: none;
+}
+
+.thumb-strip {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  max-width: 100%;
+}
+
+.thumb-card {
+  position: relative;
+  min-width: 160px;
   background: #fff;
-  border-radius: 14px;
-  border: 1px dashed var(--border);
-  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  box-shadow: 0 8px 18px rgba(75, 140, 255, 0.08);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  flex: 0 0 auto;
+}
+
+.thumb-card.active {
+  border-color: var(--primary);
+  box-shadow: 0 10px 20px rgba(75, 140, 255, 0.2);
+  transform: translateY(-1px);
+}
+
+.thumb-card.busy {
+  opacity: 0.8;
+}
+
+.thumb-image {
+  width: 52px;
+  height: 52px;
+  border-radius: 10px;
+  background: #f2f4f8;
+  background-size: cover;
+  background-position: center;
+  flex-shrink: 0;
+}
+
+.thumb-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.thumb-name {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.thumb-meta {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.thumb-state {
+  position: absolute;
+  right: 10px;
+  bottom: 8px;
+  font-size: 12px;
+  color: var(--primary-strong);
+}
+
+.thumb-state.done {
+  color: #10b981;
+}
+
+.thumb-state.error {
+  color: #ef4444;
+}
+
+.thumb-remove {
+  position: absolute;
+  right: 8px;
+  top: 6px;
+  border: none;
+  background: rgba(0, 0, 0, 0.05);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  cursor: pointer;
+  color: #6b7280;
+}
+
+.form-column {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 14px;
+  box-shadow: 0 12px 26px rgba(75, 140, 255, 0.08);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -369,83 +1091,123 @@ const submit = async () => {
   background: #fff;
 }
 
-.actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 10px;
+.field-error {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #ef4444;
 }
 
-.queue {
+.empty-form {
+  padding: 12px;
+  color: var(--muted);
+  background: #f8fafc;
+  border-radius: 12px;
+}
+
+.meta-card {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: linear-gradient(180deg, #f8fbff, #edf3ff);
   display: flex;
   flex-direction: column;
   gap: 10px;
+  font-size: 13px;
+  color: var(--text);
 }
 
-.queue-title {
+.meta-title {
   font-weight: 700;
   color: var(--primary-strong);
 }
 
-.empty {
-  color: var(--muted);
-  font-size: 14px;
-}
-
-.queue-list {
+.meta-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
 }
 
-.queue-item {
-  background: #fff;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 10px;
-  box-shadow: 0 8px 18px rgba(75, 140, 255, 0.08);
+.meta-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--muted);
+}
+
+.meta-item strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.meta-divider {
+  height: 1px;
+  background: rgba(148, 163, 184, 0.3);
+}
+
+.meta-gps {
   display: flex;
   align-items: center;
-  gap: 10px;
-}
-
-.thumb {
-  width: 64px;
-  height: 64px;
-  border-radius: 10px;
-  background: #f2f4f8;
-  background-size: cover;
-  background-position: center;
-  flex-shrink: 0;
-}
-
-.queue-info {
-  flex: 1;
-  overflow: hidden;
-}
-
-.name {
-  font-weight: 600;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.meta {
+  justify-content: space-between;
+  gap: 8px;
   color: var(--muted);
-  font-size: 13px;
-  margin-top: 4px;
 }
 
-@media (max-width: 960px) {
-  .grid {
+.meta-gps-text {
+  flex: 1;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: auto;
+  flex-wrap: wrap;
+}
+
+.glossy-btn {
+  background: linear-gradient(135deg, #60a5fa, #2563eb) !important;
+  border: none !important;
+  color: #fff !important;
+  box-shadow: 0 10px 18px rgba(59, 130, 246, 0.28);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.glossy-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px rgba(59, 130, 246, 0.32);
+}
+
+.glossy-btn:active {
+  transform: translateY(1px);
+  box-shadow: 0 8px 16px rgba(59, 130, 246, 0.2);
+}
+
+.dialog-body {
+  color: var(--text);
+  line-height: 1.6;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 1100px) {
+  .workspace {
     grid-template-columns: 1fr;
+  }
+
+  .actions {
+    justify-content: flex-start;
   }
 }
 
 @media (max-width: 768px) {
   .upload-page {
     gap: 12px;
+    padding: 0 14px 24px;
   }
 
   .header {
@@ -454,35 +1216,12 @@ const submit = async () => {
     gap: 6px;
   }
 
-  .card {
-    padding: 12px;
+  .preview-stage {
+    height: 280px;
   }
 
-  .drop-inner {
-    padding: 14px;
-  }
-
-  .drag-area {
-    padding: 22px 10px;
-  }
-
-  .msg {
-    font-size: 16px;
-  }
-
-  .actions {
-    flex-wrap: wrap;
-    justify-content: flex-start;
-    gap: 8px;
-  }
-
-  .actions :deep(.el-button) {
-    flex: 1 1 48%;
-    min-height: 44px;
-  }
-
-  .queue-list {
-    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  .thumb-card {
+    min-width: 140px;
   }
 }
 </style>
