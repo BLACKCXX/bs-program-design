@@ -3,7 +3,6 @@ import { nextTick, ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { UploadFilled, Plus, Loading } from '@element-plus/icons-vue'
 import api from '../api/http'
-import { AI_FILL_LABEL } from '../utils/useAiAnalyzer'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -655,7 +654,7 @@ const onCancel = () => {
       <div class="dialog-body">还有 {{ missingCount }} 张图片未完善信息，可继续设置或使用 AI 智能分析补全。</div>
       <template #footer>
         <el-button @click="goToFirstIncomplete">继续设置</el-button>
-        <el-button type="primary" :loading="aiProcessing" @click="autoFillIncomplete">{{ AI_FILL_LABEL }}</el-button>
+        <el-button type="primary" :loading="aiProcessing" @click="autoFillIncomplete">AI 一键补全</el-button>
       </template>
     </el-dialog>
   </el-dialog>

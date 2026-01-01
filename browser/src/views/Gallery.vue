@@ -61,6 +61,19 @@ const tagLoading = ref(false)
 const stats = reactive({ total: 0, today: 0 })
 const statsLoaded = ref(false)
 
+const keywordTokens = computed(() => {
+  const raw = (filters.keyword || '').trim().toLowerCase()
+  if (!raw) return []
+  return raw.split(/[\s,，]+/).filter(Boolean)
+})
+
+const isTagHit = (tag = '') => {
+  const tokens = keywordTokens.value
+  if (!tokens.length) return false
+  const lower = String(tag).toLowerCase()
+  return tokens.some((t) => lower.includes(t))
+}
+
 const formatDate = (val) => {
   if (!val) return ''
   if (typeof val === 'string') return val.slice(0, 10)
@@ -533,7 +546,7 @@ onMounted(fetchTags)*/
             <div class="card-body">
               <h4 class="title">{{ it.title || '未命名' }}</h4>
               <div class="tags">
-                <el-tag v-for="t in it.tags" :key="t" size="small" effect="plain">{{ t }}</el-tag>
+                <el-tag v-for="t in it.tags" :key="t" size="small" :type="isTagHit(t) ? 'success' : 'info'" effect="plain">{{ t }}</el-tag>
               </div>
               <div class="meta">
                 <span>{{ it.date || '—' }}</span><span>·</span>

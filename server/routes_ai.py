@@ -3,9 +3,11 @@
 AI 工作台路由：聊天检索 + 兜底内容分析。
 """
 
-from typing import Dict
+import json
+from collections import Counter
+from typing import Dict, List
 
-from flask import Blueprint, jsonify, request, g
+from flask import Blueprint, Response, request, g
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
 from server.ai_search_agent import (
@@ -17,6 +19,12 @@ from server.ai_search_agent import (
 )
 
 bp = Blueprint("ai", __name__)
+
+
+def _json_response(payload: Dict, status: int = 200) -> Response:
+    """Return JSON with explicit UTF-8 charset to avoid mojibake in clients."""
+    body = json.dumps(payload, ensure_ascii=False)
+    return Response(body, status=status, content_type="application/json; charset=utf-8")
 
 
 def _current_user_id_from_jwt():
@@ -45,6 +53,51 @@ def _to_camel(item: Dict) -> Dict:
     }
 
 
+def _build_match_summary(results: List[Dict]) -> str:
+    field_map = {"tags": "标签", "title": "标题", "description": "描述"}
+    counts: Counter = Counter()
+    for item in results:
+        for field in item.get("matched_fields") or []:
+            if field in field_map:
+                counts[field] += 1
+    if not counts:
+        return ""
+    top = [field_map[k] for k, _ in counts.most_common(2)]
+    return "、".join(top)
+
+
+def _summarize_results(results: List[Dict]) -> str:
+    if not results:
+        return ""
+    item = results[0]
+    text = (item.get("description") or item.get("title") or "").strip()
+    if not text:
+        return "与主题最相关的图片"
+    text = " ".join(text.split())
+    if len(text) > 36:
+        text = text[:36].rstrip("，。;；,") + "..."
+    for prefix in ("这是一张", "一张", "一幅", "一组", "一处"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].lstrip(" ，。:：")
+            break
+    return text
+
+
+def _build_reply(
+    message: str,
+    results: List[Dict],
+    used_expansion: bool,
+    used_fallback: bool,
+    expanded_keywords: List[str],
+) -> str:
+    if not results:
+        return f"图库里暂时没有命中「{message}」的图片。你可以换个关键词或补充标签再试试。"
+
+    count = len(results)
+    summary = _summarize_results(results)
+    return f"我找到了 {count} 张与「{message}」相关的图片，这是一张{summary}。"
+
+
 @bp.post("/api/ai/chat-search")
 @jwt_required()
 def chat_search():
@@ -54,7 +107,7 @@ def chat_search():
         data = request.get_json(silent=True) or {}
         message = (data.get("message") or data.get("q") or "").strip()
         if not message:
-            return jsonify({"ok": False, "error": "缺少搜索内容"}), 400
+            return _json_response({"ok": False, "error": "缺少搜索内容"}, 400)
 
         limit = int(data.get("limit") or 12)
         limit = max(1, min(limit, 30))
@@ -63,7 +116,7 @@ def chat_search():
 
         query_obj = ai_build_search_query(message)
         if not (query_obj.get("keywords") or []):
-            return jsonify(
+            return _json_response(
                 {
                     "ok": True,
                     "reply": "关键词过少或过于宽泛，请提供更具体的描述再试试～",
@@ -167,14 +220,9 @@ def chat_search():
         final_list.sort(key=lambda x: (-(x.get("score") or 0), x.get("title") or ""))
         if len(final_list) > limit:
             final_list = final_list[:limit]
-        if fallback_called:
-            reply = f"元数据命中较少，我补充了关键词扩展并用 AI 分析内容，最终找到 {len(final_list)} 张可能相关的图片。"
-        elif used_expansion:
-            reply = f"我为你扩展了搜索词（如：{'、'.join(expanded_keywords)}），共找到 {len(final_list)} 张相关图片。"
-        else:
-            reply = f"我帮你找到了 {len(final_list)} 张与「{message}」相关的图片。"
+        reply = _build_reply(message, final_list, used_expansion, used_fallback, expanded_keywords)
 
-        return jsonify(
+        return _json_response(
             {
                 "ok": True,
                 "reply": reply,
@@ -185,4 +233,4 @@ def chat_search():
             }
         )
     except Exception as exc:
-        return jsonify({"ok": False, "error": "数据库或检索异常", "detail": str(exc)}), 500
+        return _json_response({"ok": False, "error": "数据库或检索异常", "detail": str(exc)}, 500)

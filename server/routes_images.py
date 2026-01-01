@@ -549,8 +549,14 @@ def search_images():
     # 名称 / 描述模糊
     if q:
         like = f"%{q}%"
-        conditions.append("(i.title LIKE %s OR i.description LIKE %s)")
-        params.extend([like, like])
+        conditions.append(
+            "(i.title LIKE %s OR i.description LIKE %s OR EXISTS ("
+            "SELECT 1 FROM image_tags itq "
+            "JOIN tags tq ON tq.id = itq.tag_id "
+            "WHERE itq.image_id = i.id AND tq.owner_id=%s AND tq.name LIKE %s"
+            "))"
+        )
+        params.extend([like, like, g.user_id, like])
 
     # 时间范围（取拍摄时间/创建时间）
     ts_expr = "COALESCE(i.taken_at, i.created_at)"

@@ -46,6 +46,19 @@ const sizeRange = computed({
 
 const resultCount = computed(() => results.value.length)
 
+const keywordTokens = computed(() => {
+  const raw = filters.keyword.trim().toLowerCase()
+  if (!raw) return []
+  return raw.split(/[\s,，]+/).filter(Boolean)
+})
+
+const isTagHit = (tag = '') => {
+  const tokens = keywordTokens.value
+  if (!tokens.length) return false
+  const lower = String(tag).toLowerCase()
+  return tokens.some((t) => lower.includes(t))
+}
+
 function formatDateInput(val) {
   if (!val) return ''
   if (typeof val === 'string') return val.slice(0, 10)
@@ -384,7 +397,7 @@ onMounted(() => {
               <div class="title">{{ item.title }}</div>
               <div class="meta">{{ item.date || '未知时间' }} · {{ item.size || '未知大小' }}</div>
               <div class="tags">
-                <el-tag v-for="tag in item.tags" :key="tag" size="small" effect="plain">{{ tag }}</el-tag>
+                <el-tag v-for="tag in item.tags" :key="tag" size="small" :type="isTagHit(tag) ? 'success' : 'info'" effect="plain">{{ tag }}</el-tag>
               </div>
             </div>
           </div>
@@ -400,7 +413,7 @@ onMounted(() => {
               </div>
               <p v-if="item.description" class="desc">{{ item.description }}</p>
               <div class="tags">
-                <el-tag v-for="tag in item.tags" :key="tag" size="small" effect="plain">{{ tag }}</el-tag>
+                <el-tag v-for="tag in item.tags" :key="tag" size="small" :type="isTagHit(tag) ? 'success' : 'info'" effect="plain">{{ tag }}</el-tag>
               </div>
             </div>
           </div>
@@ -413,7 +426,7 @@ onMounted(() => {
               <div class="title">{{ item.title }}</div>
               <div class="meta">{{ item.date || '未知时间' }} · {{ item.size || '未知大小' }}</div>
               <div class="tags">
-                <el-tag v-for="tag in item.tags" :key="tag" size="small" effect="plain">{{ tag }}</el-tag>
+                <el-tag v-for="tag in item.tags" :key="tag" size="small" :type="isTagHit(tag) ? 'success' : 'info'" effect="plain">{{ tag }}</el-tag>
               </div>
             </div>
           </div>

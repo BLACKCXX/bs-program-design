@@ -2,7 +2,7 @@
 import { ref, computed, watch, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, ZoomOut, ZoomIn, FullScreen } from '@element-plus/icons-vue'
+import { ArrowLeft, ZoomOut, ZoomIn, FullScreen, RefreshLeft, RefreshRight } from '@element-plus/icons-vue'
 import api from '../api/http'
 
 const route = useRoute()
@@ -32,10 +32,15 @@ const checkpointUrl = ref('')
 
 const zoom = ref(100)
 const changeZoom = (delta) => {
-  zoom.value = Math.min(200, Math.max(33, zoom.value + delta))
+  const next = Math.min(200, Math.max(33, zoom.value + delta))
+  if (next === zoom.value) return
+  zoom.value = next
+  captureSnapshot()
 }
 const fitScreen = () => {
+  if (zoom.value === 100) return
   zoom.value = 100
+  captureSnapshot()
 }
 
 const normalizeFilePath = (p = '') => {
@@ -139,7 +144,7 @@ const loadDetail = async () => {
     saturation.value = 0
     warmth.value = 0
     sharpen.value = 0
-    history.value = []
+    resetHistory()
     exportName.value = image.value.title || ''
   } catch (err) {
     ElMessage.error(err?.response?.data?.error || '加载图片详情失败')
@@ -154,6 +159,7 @@ const isCropping = ref(false)
 const cropRect = ref({ x: 0, y: 0, width: 0, height: 0 })
 const dragState = ref(null)
 const history = ref([])
+const redoStack = ref([])
 
 const brightness = ref(0)
 const contrast = ref(0)
@@ -296,14 +302,6 @@ onUnmounted(() => {
   }
 })
 
-watch(
-  () => route.params.id,
-  () => {
-    loadDetail()
-  },
-  { immediate: true }
-)
-
 const clearPreviewObjectUrl = () => {
   if (previewObjectUrl.value) {
     URL.revokeObjectURL(previewObjectUrl.value)
@@ -409,35 +407,92 @@ watch([brightness, contrast, saturation, warmth, sharpen], () => {
   schedulePreview()
 })
 
-const captureSnapshot = () => {
-  history.value.push({
-    brightness: brightness.value,
-    contrast: contrast.value,
-    saturation: saturation.value,
-    warmth: warmth.value,
-    sharpen: sharpen.value,
-    cropRect: cropRect.value ? { ...cropRect.value } : null,
-    isScaling: isScaling.value,
-    scaleRect: scaleRect.value ? { ...scaleRect.value } : null,
-    scaleBase: scaleBase.value ? { ...scaleBase.value } : null,
-  })
+const snapshotState = () => ({
+  zoom: zoom.value,
+  brightness: brightness.value,
+  contrast: contrast.value,
+  saturation: saturation.value,
+  warmth: warmth.value,
+  sharpen: sharpen.value,
+  cropRect: cropRect.value ? { ...cropRect.value } : null,
+  isScaling: isScaling.value,
+  scaleRect: scaleRect.value ? { ...scaleRect.value } : null,
+  scaleBase: scaleBase.value ? { ...scaleBase.value } : null,
+})
+
+const isSameSnapshot = (a, b) => {
+  if (!a || !b) return false
+  const rectEqual = (left, right) => JSON.stringify(left || null) === JSON.stringify(right || null)
+  return (
+    a.zoom === b.zoom &&
+    a.brightness === b.brightness &&
+    a.contrast === b.contrast &&
+    a.saturation === b.saturation &&
+    a.warmth === b.warmth &&
+    a.sharpen === b.sharpen &&
+    a.isScaling === b.isScaling &&
+    rectEqual(a.cropRect, b.cropRect) &&
+    rectEqual(a.scaleRect, b.scaleRect) &&
+    rectEqual(a.scaleBase, b.scaleBase)
+  )
 }
 
-const undo = () => {
-  const prev = history.value.pop()
-  if (!prev) return
-  brightness.value = prev.brightness
-  contrast.value = prev.contrast
-  saturation.value = prev.saturation
-  warmth.value = prev.warmth
-  sharpen.value = prev.sharpen
-  cropRect.value = prev.cropRect ? { ...prev.cropRect } : { ...cropRect.value }
-  isScaling.value = prev.isScaling ?? false
-  scaleRect.value = prev.scaleRect ? { ...prev.scaleRect } : { ...scaleRect.value }
-  scaleBase.value = prev.scaleBase ? { ...prev.scaleBase } : { ...scaleBase.value }
+const resetHistory = () => {
+  history.value = [snapshotState()]
+  redoStack.value = []
+}
+
+const captureSnapshot = () => {
+  const snapshot = snapshotState()
+  const last = history.value[history.value.length - 1]
+  if (last && isSameSnapshot(last, snapshot)) return
+  history.value.push(snapshot)
+  redoStack.value = []
+}
+
+const applySnapshot = (snapshot) => {
+  if (!snapshot) return
+  zoom.value = snapshot.zoom ?? zoom.value
+  brightness.value = snapshot.brightness ?? brightness.value
+  contrast.value = snapshot.contrast ?? contrast.value
+  saturation.value = snapshot.saturation ?? saturation.value
+  warmth.value = snapshot.warmth ?? warmth.value
+  sharpen.value = snapshot.sharpen ?? sharpen.value
+  // Null-safe restore to avoid spreading a null cropRect snapshot.
+  cropRect.value = snapshot.cropRect ? { ...snapshot.cropRect } : null
+  isScaling.value = snapshot.isScaling ?? false
+  scaleRect.value = snapshot.scaleRect ? { ...snapshot.scaleRect } : { ...scaleRect.value }
+  scaleBase.value = snapshot.scaleBase ? { ...snapshot.scaleBase } : { ...scaleBase.value }
   isCropping.value = false
   refreshPreview()
 }
+
+const canUndo = computed(() => history.value.length > 1)
+const canRedo = computed(() => redoStack.value.length > 0)
+
+const undo = () => {
+  if (!canUndo.value) return
+  const current = history.value.pop()
+  if (current) redoStack.value.push(current)
+  const prev = history.value[history.value.length - 1]
+  applySnapshot(prev)
+}
+
+const redo = () => {
+  if (!canRedo.value) return
+  const next = redoStack.value.pop()
+  if (!next) return
+  history.value.push(next)
+  applySnapshot(next)
+}
+
+watch(
+  () => route.params.id,
+  () => {
+    loadDetail()
+  },
+  { immediate: true }
+)
 
 const toggleCropMode = () => {
   if (!isCropping.value) {
@@ -495,7 +550,6 @@ const applyRotate = async (delta) => {
 }
 
 const resetAdjust = async () => {
-  captureSnapshot()
   brightness.value = 0
   contrast.value = 0
   saturation.value = 0
@@ -507,6 +561,7 @@ const resetAdjust = async () => {
   scaleBase.value = { w: 0, h: 0 }
   initCropRect()
   await refreshPreview()
+  captureSnapshot()
 }
 
 const scaleLoading = ref(false)
@@ -559,7 +614,6 @@ const applyScale = async () => {
 
   scaleLoading.value = true
   try {
-    captureSnapshot()
     const payload = {
       mode: 'override',
       // 后端 Pillow 使用 LANCZOS 重采样，确保像素级缩放（stretch）
@@ -574,6 +628,7 @@ const applyScale = async () => {
     isScaling.value = false
     scaleBase.value = { w: targetW, h: targetH }
     scaleRect.value = { width: targetW, height: targetH }
+    captureSnapshot()
     await refreshPreview()
     ElMessage.success('已应用缩放')
   } catch (err) {
@@ -585,6 +640,7 @@ const applyScale = async () => {
 
 function startScaleDrag(evt, handle) {
   if (!isScaling.value || !scaleBase.value.w || !scaleBase.value.h) return
+  captureSnapshot()
   scaleDragState.value = {
     handle,
     startX: evt.clientX,
@@ -638,6 +694,9 @@ function endScaleDrag() {
   window.removeEventListener('mousemove', onScaleDrag)
   window.removeEventListener('mouseup', endScaleDrag)
   scaleDragState.value = null
+  if (isScaling.value) {
+    captureSnapshot()
+  }
 }
 
 const cropLoading = ref(false)
@@ -654,7 +713,6 @@ const applyCrop = async () => {
   }
   cropLoading.value = true
   try {
-    captureSnapshot()
     const payload = {
       mode: 'override',
       crop_rect: rect,
@@ -664,6 +722,7 @@ const applyCrop = async () => {
     image.value.height = Math.round(rect.height)
     isCropping.value = false
     initCropRect()
+    captureSnapshot()
     await refreshPreview()
     ElMessage.success('已应用裁剪')
   } catch (err) {
@@ -698,6 +757,7 @@ const scaleInfo = computed(() => {
 
 const startDrag = (evt, mode) => {
   if (!isCropping.value || !imgBox.value.w) return
+  captureSnapshot()
   dragState.value = {
     mode,
     startX: evt.clientX,
@@ -745,6 +805,7 @@ const endDrag = () => {
   window.removeEventListener('mousemove', onDrag)
   window.removeEventListener('mouseup', endDrag)
   dragState.value = null
+  captureSnapshot()
 }
 
 const exportMode = ref('override')
@@ -801,10 +862,24 @@ const goBack = () => {
         <div class="stage-shell">
           <div class="stage">
             <div class="stage-toolbar">
-              <el-button text :icon="ZoomOut" @click="changeZoom(-10)" />
-              <span class="zoom-text">{{ zoom }}%</span>
-              <el-button text :icon="ZoomIn" @click="changeZoom(10)" />
-              <el-button text :icon="FullScreen" @click="fitScreen">适应屏幕</el-button>
+              <div class="stage-toolbar-left">
+                <el-button text :icon="ZoomOut" @click="changeZoom(-10)" />
+                <span class="zoom-text">{{ zoom }}%</span>
+                <el-button text :icon="ZoomIn" @click="changeZoom(10)" />
+                <el-button text :icon="FullScreen" @click="fitScreen">适应屏幕</el-button>
+              </div>
+              <div class="stage-toolbar-right">
+                <el-tooltip :content="canUndo ? '撤回上一步' : '暂无可撤回操作'" placement="top">
+                  <span>
+                    <el-button text :icon="RefreshLeft" :disabled="!canUndo" @click="undo" />
+                  </span>
+                </el-tooltip>
+                <el-tooltip :content="canRedo ? '重做一步' : '暂无可重做操作'" placement="top">
+                  <span>
+                    <el-button text :icon="RefreshRight" :disabled="!canRedo" @click="redo" />
+                  </span>
+                </el-tooltip>
+              </div>
             </div>
             <div class="stage-body">
               <el-skeleton v-if="loading" :rows="6" animated style="width:100%;height:360px;" />
@@ -989,8 +1064,15 @@ const goBack = () => {
 .stage-toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 12px;
   margin-bottom: 10px;
+}
+.stage-toolbar-left,
+.stage-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .zoom-text {
   width: 56px;

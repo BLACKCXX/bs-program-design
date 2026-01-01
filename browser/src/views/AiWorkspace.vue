@@ -1,8 +1,8 @@
 <script setup>
 import { nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { MagicStick, ChatLineRound, Loading } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { MagicStick, ChatLineRound, Loading, Delete } from '@element-plus/icons-vue'
 import { storeToRefs } from 'pinia'
 import api from '../api/http'
 import { useAiWorkspaceStore } from '../stores/aiWorkspace'
@@ -30,6 +30,12 @@ const allTags = ref([])
 const loadingTags = ref(false)
 const requestId = ref(0)
 
+const appendMessage = (payload, { persist = true } = {}) => {
+  const msg = workspaceStore.pushMessage(payload)
+  if (persist) workspaceStore.persist()
+  return msg
+}
+
 const synonymMap = {
   风景: ['景色', '自然', '山水'],
   夜景: ['夜晚', '夜色'],
@@ -38,12 +44,6 @@ const synonymMap = {
   旅行: ['旅途', '旅游'],
   自然: ['户外', '森林'],
   美食: ['美味', '料理'],
-}
-
-const ensureHistory = () => {
-  if (!messages.value.length) {
-    workspaceStore.reset()
-  }
 }
 
 const loadAllTags = async () => {
@@ -72,9 +72,18 @@ const tokenize = (text = '') => {
   return parts.slice(0, 12)
 }
 
+const formatTime = (ts) => {
+  if (!ts) return ''
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
+
 const latestResultsFromHistory = () => {
   const reversed = [...messages.value].reverse()
-  const found = reversed.find((msg) => Array.isArray(msg.results) && msg.results.length)
+  const found = reversed.find((msg) => msg.type === 'results' && Array.isArray(msg.results) && msg.results.length)
   return found?.results || []
 }
 
@@ -124,22 +133,46 @@ const scrollToBottom = async () => {
   if (el) el.scrollTop = el.scrollHeight
 }
 
-const removeTyping = () => {
-  if (typingMsg.value) {
-    const idx = messages.value.indexOf(typingMsg.value)
-    if (idx >= 0) messages.value.splice(idx, 1)
-    typingMsg.value = null
-  }
+const discardTyping = () => {
+  if (!typingMsg.value) return
+  const idx = messages.value.indexOf(typingMsg.value)
+  if (idx >= 0) messages.value.splice(idx, 1)
+  typingMsg.value = null
 }
 
-const filterStrongResults = (list = []) => {
-  return (list || []).filter((item) => {
-    const fields = new Set(item.matchedFields || item.matched_fields || [])
-    const score = Number(item.score ?? item.match_score ?? 0)
-    if (!fields.size) return false
-    if (fields.has('tags') || fields.has('title')) return score >= 2.5
-    return score >= 3.0
-  })
+const finalizeTyping = (payload = {}) => {
+  if (!typingMsg.value) return
+  Object.assign(typingMsg.value, payload)
+  typingMsg.value = null
+  workspaceStore.persist()
+}
+
+const removeMessage = (msg) => {
+  if (!msg?.id) return
+  workspaceStore.removeMessage(msg.id)
+  if (!messages.value.length) {
+    workspaceStore.setLastQuery('')
+    workspaceStore.setTagSuggestions([])
+  } else if (lastQuery.value) {
+    refreshTagSuggestions(lastQuery.value, latestResultsFromHistory())
+  }
+  workspaceStore.persist()
+}
+
+const clearMessages = async () => {
+  if (!messages.value.length) return
+  try {
+    await ElMessageBox.confirm('确认清空所有对话记录吗？', '清空记录', {
+      confirmButtonText: '清空',
+      cancelButtonText: '取消',
+      type: 'warning',
+    })
+  } catch (err) {
+    return
+  }
+  discardTyping()
+  workspaceStore.clearAll()
+  input.value = ''
 }
 
 const normalizeResult = (item = {}) => {
@@ -173,68 +206,53 @@ const send = async (preset) => {
   const content = (preset ?? input.value).trim()
   if (!content || sending.value) return
   const currentReq = ++requestId.value
-  // 清空旧的 results，避免残留或覆盖
-  workspaceStore.setMessages(workspaceStore.messages.filter((m) => m.type !== 'results'))
-  const userMsg = { role: 'user', type: 'text', content }
-  workspaceStore.pushMessage(userMsg)
+
+  appendMessage({ role: 'user', type: 'text', content })
   workspaceStore.setLastQuery(content)
   workspaceStore.persist()
   await scrollToBottom()
 
   input.value = ''
   sending.value = true
-  typingMsg.value = { role: 'ai', type: 'typing', id: `typing-${Date.now()}` }
-  messages.value.push(typingMsg.value)
+  typingMsg.value = appendMessage({ role: 'ai', type: 'typing', content: '' }, { persist: false })
   await scrollToBottom()
   refreshTagSuggestions(content, latestResultsFromHistory())
 
   try {
     const { data } = await api.post('/api/ai/chat-search', { message: content })
-    if (currentReq !== requestId.value) return
+    if (currentReq !== requestId.value) {
+      discardTyping()
+      return
+    }
     const isError = data && data.ok === false
-    removeTyping()
     if (isError) {
-      const msg = data.error || data.detail || '检索失败'
+      const msg = data.error || data.detail || '请求失败'
       ElMessage.error(msg)
-      workspaceStore.pushMessage({ role: 'ai', type: 'text', content: msg })
-      workspaceStore.persist()
+      finalizeTyping({ type: 'text', content: msg, results: [] })
       await scrollToBottom()
       return
     }
 
-    const filtered = filterStrongResults(data?.results || [])
-    const results = filtered.map(normalizeResult)
-    if (!results.length) {
-      workspaceStore.pushMessage({
-        role: 'ai',
-        type: 'text',
-        content: `未找到与「${content}」强相关的图片（请确认是否已为图片打过该标签）。`,
-      })
-      workspaceStore.persist()
-      await scrollToBottom()
+    const rawResults = Array.isArray(data?.results) ? data.results : []
+    const results = rawResults.map(normalizeResult)
+    const replyText = data?.reply || '我先为你整理了相关图片。'
+    finalizeTyping({ type: results.length ? 'results' : 'text', content: replyText, results })
+    refreshTagSuggestions(content, results)
+  } catch (err) {
+    if (currentReq !== requestId.value) {
+      discardTyping()
       return
     }
-    refreshTagSuggestions(content, results)
-    workspaceStore.pushMessage({
-      role: 'ai',
-      type: 'results',
-      content: data?.reply || '这是为你找到的结果：',
-      results,
-    })
-    workspaceStore.persist()
-  } catch (err) {
-    if (currentReq !== requestId.value) return
-    removeTyping()
-    const msg = err?.response?.data?.error || err?.response?.data?.detail || '检索失败'
+    const msg = err?.response?.data?.error || err?.response?.data?.detail || '请求失败'
     ElMessage.error(msg)
-    workspaceStore.pushMessage({ role: 'ai', type: 'text', content: msg })
-    workspaceStore.persist()
+    finalizeTyping({ type: 'text', content: msg, results: [] })
   } finally {
-    removeTyping()
     sending.value = false
     await scrollToBottom()
   }
 }
+
+
 
 const applyTagSuggestion = (tag) => {
   const name = (tag || '').trim()
@@ -284,7 +302,6 @@ const rejectTag = (res, tag) => {
 }
 
 onMounted(async () => {
-  ensureHistory()
   await nextTick()
   await scrollToBottom()
   await loadAllTags()
@@ -338,7 +355,10 @@ watch(
           <el-icon><ChatLineRound /></el-icon>
           <span>对话区</span>
         </div>
-        <el-tag type="warning" effect="plain">已接入 AI 检索与推荐标签</el-tag>
+        <div class="chat-actions">
+          <el-button text type="danger" :disabled="!messages.length" @click="clearMessages">????</el-button>
+          <el-tag type="warning" effect="plain">已接入 AI 检索与推荐标签</el-tag>
+        </div>
       </div>
       <div v-if="tagSuggestions?.length" class="tag-suggest">
         <div class="tag-suggest-title">AI 推荐标签（基于图库已有标签）</div>
@@ -361,50 +381,44 @@ watch(
             class="bubble-row"
             :class="msg.role"
           >
+            <div class="avatar" :class="msg.role">{{ msg.role === 'ai' ? 'AI' : 'Me' }}</div>
             <div class="bubble">
-              <span v-if="msg.role === 'ai'" class="label">AI</span>
-              <span v-else class="label user">Me</span>
+              <div class="bubble-header">
+                <div class="bubble-meta">
+                  <span v-if="msg.role === 'ai'" class="label">AI</span>
+                  <span v-else class="label user">Me</span>
+                  <span v-if="msg.timestamp" class="time">{{ formatTime(msg.timestamp) }}</span>
+                </div>
+                <el-button
+                  v-if="msg.type !== 'typing'"
+                  class="delete-btn"
+                  text
+                  :icon="Delete"
+                  @click.stop="removeMessage(msg)"
+                />
+              </div>
               <p v-if="msg.type === 'text' && msg.content">{{ msg.content }}</p>
               <div v-else-if="msg.type === 'typing'" class="typing-dots">
                 <span></span><span></span><span></span>
               </div>
-              <div v-else-if="msg.results?.length" class="result-grid">
-                <div
-                  v-for="item in msg.results"
-                  :key="item.id || item.detailUrl"
-                  class="result-card"
-                  @click="openDetail(item)"
-                >
-                  <div class="thumb" :style="item.thumbUrl ? { backgroundImage: `url(${item.thumbUrl})` } : {}">
-                    <span v-if="!item.thumbUrl" class="thumb-placeholder">No Image</span>
-                  </div>
-                  <div class="meta">
-                    <h4 class="title">{{ item.title }}</h4>
-                    <p class="caption">{{ item.shortCaption || item.description || '暂无描述' }}</p>
-                    <div class="match-info" v-if="item.matchedFields?.length || item.score">
-                      <span v-if="item.score" class="score-pill">得分 {{ Number(item.score).toFixed(2) }}</span>
-                      <span v-if="item.matchedFields?.length" class="matched-fields">命中: {{ item.matchedFields.join('、') }}</span>
-                    </div>
-                    <div class="tag-row">
-                      <el-tag v-for="t in item.tags" :key="t" size="small" effect="plain">{{ t }}</el-tag>
-                      <span v-if="!item.tags?.length" class="tag-empty">暂无标签</span>
-                    </div>
-                    <div v-if="item.suggestedTags?.length" class="suggest">
-                      <span class="suggest-label">AI 推荐标签：</span>
-                      <div class="suggest-tags">
-                        <div v-for="t in item.suggestedTags" :key="t" class="suggest-item">
-                          <el-tag type="warning" size="small" effect="plain">{{ t }}</el-tag>
-                          <el-button text size="small" @click.stop="acceptTag(item, t)">采纳</el-button>
-                          <el-button text size="small" @click.stop="rejectTag(item, t)">拒绝</el-button>
-                        </div>
-                      </div>
-                    </div>
+              <div v-else-if="msg.type === 'results'" class="result-block">
+                <p v-if="msg.content" class="result-text">{{ msg.content }}</p>
+                <div v-if="msg.results?.length" class="result-grid">
+                  <div
+                    v-for="item in msg.results"
+                    :key="item.id || item.detailUrl"
+                    class="result-thumb"
+                    @click="openDetail(item)"
+                  >
+                    <el-image
+                      v-if="item.thumbUrl"
+                      :src="item.thumbUrl"
+                      fit="cover"
+                      class="thumb-img"
+                    />
+                    <span v-else class="thumb-placeholder">No Image</span>
                   </div>
                 </div>
-              </div>
-              <div v-else-if="msg.role === 'ai'" class="result-empty">
-                <p>暂时没有命中图片，试试调整关键词或让 AI 推荐标签？</p>
-                <el-button size="small" type="primary" @click="send('推荐一些相关标签，帮助我搜索图片')">让 AI 推荐标签</el-button>
               </div>
             </div>
           </div>
@@ -499,6 +513,12 @@ watch(
   justify-content: space-between;
 }
 
+.chat-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .title {
   display: flex;
   align-items: center;
@@ -563,24 +583,78 @@ watch(
 
 .bubble-row {
   display: flex;
+  align-items: flex-start;
+  gap: 10px;
 }
 
 .bubble-row.user {
+  justify-content: flex-start;
+  flex-direction: row;
+}
+
+.bubble-row.ai {
   justify-content: flex-end;
+  flex-direction: row-reverse;
+}
+
+.avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  background: #dbeafe;
+  color: var(--primary-strong);
+  border: 1px solid var(--border);
+}
+
+.avatar.ai {
+  background: #eef2ff;
+  color: var(--primary-strong);
 }
 
 .bubble {
-  max-width: 96%;
+  max-width: 86%;
   background: #fff;
   border-radius: 14px;
   padding: 10px 12px;
   border: 1px solid var(--border);
   box-shadow: 0 8px 18px rgba(75, 140, 255, 0.08);
-  width: 100%;
+  position: relative;
 }
 
 .bubble-row.user .bubble {
   background: linear-gradient(135deg, #e5f0ff, #d7e8ff);
+}
+
+.bubble-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.bubble-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.time {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.delete-btn {
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.bubble:hover .delete-btn {
+  opacity: 1;
 }
 
 .bubble p {
@@ -634,50 +708,47 @@ watch(
 
 .result-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
   margin-top: 8px;
 }
 
-.result-card {
+.result-block {
+  margin-top: 4px;
+}
+
+.result-text {
+  margin: 4px 0 8px;
+  color: var(--text);
+  line-height: 1.6;
+}
+
+.result-thumb {
   border: 1px solid var(--border);
   border-radius: 12px;
   overflow: hidden;
   background: #f8fbff;
   cursor: pointer;
   transition: all 0.15s ease;
-}
-
-.result-card:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 10px 22px rgba(75, 140, 255, 0.18);
-}
-.match-info {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  margin: 4px 0;
-  color: var(--muted);
-  font-size: 12px;
-}
-.score-pill {
-  background: #ecfdf3;
-  color: #166534;
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-weight: 700;
-}
-.matched-fields {
-  color: #6b7280;
-}
-
-.thumb {
   aspect-ratio: 4 / 3;
-  background-size: cover;
-  background-position: center;
-  background-color: #eef2ff;
   display: grid;
   place-items: center;
+}
+
+.result-thumb:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 10px 22px rgba(75, 140, 255, 0.18);
+}
+
+.thumb-img {
+  width: 100%;
+  height: 100%;
+}
+
+.thumb-img :deep(.el-image__inner) {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .thumb-placeholder {
@@ -685,65 +756,6 @@ watch(
   font-size: 13px;
 }
 
-.meta {
-  padding: 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.meta .title {
-  margin: 0;
-  color: #1f2937;
-  font-size: 15px;
-}
-
-.caption {
-  margin: 0;
-  color: #6b7280;
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.tag-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.tag-empty {
-  color: #9aa0a6;
-  font-size: 12px;
-}
-
-.suggest {
-  background: #fff7ed;
-  border: 1px dashed #fdba74;
-  border-radius: 8px;
-  padding: 6px;
-}
-
-.suggest-label {
-  font-size: 12px;
-  color: #c2410c;
-}
-
-.suggest-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 4px;
-}
-
-.suggest-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  background: #fff;
-  border: 1px solid #fde68a;
-  border-radius: 6px;
-  padding: 4px 6px;
-}
 .result-empty {
   margin-top: 8px;
   padding: 10px;

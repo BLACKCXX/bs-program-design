@@ -2,7 +2,7 @@
 // 页面职责：加载 /api/images/:id 的详情并展示预览/信息
 import { ref, computed, onUnmounted, watch, onMounted, nextTick } from 'vue'
 import api from '../api/http'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, Download, Delete as DeleteIcon, ZoomOut, ZoomIn, FullScreen, MagicStick } from '@element-plus/icons-vue'
 
@@ -35,11 +35,15 @@ const blobUrl = ref('')
 const previewKey = computed(() => `${previewSrc.value || 'empty'}`)
 const loading = ref(false)
 const loadError = ref('')
+const isEditingMeta = ref(false)
+const savingMeta = ref(false)
+const metaForm = ref({ title: '', description: '', visibility: 'public' })
+const originalMeta = ref({ title: '', description: '', visibility: 'public' })
 
 // 右侧信息区和预览相关 UI 状态
 const activeTab = ref('basic')
 const zoom = ref(100)
-const displayMode = ref('fillWidth')
+const viewMode = ref('fitScreen')
 const imgLoading = ref(false)
 const showGps = ref(false)
 const newTag = ref('')
@@ -55,6 +59,28 @@ const fileInfo = computed(() => ({
   sizeText: image.value.sizeMB ? `${image.value.sizeMB} MB` : '未知',
   dimension: image.value.width && image.value.height ? `${image.value.width} × ${image.value.height}` : '未知',
 }))
+
+const normalizeMeta = (source = {}) => ({
+  title: (source.title || '').trim(),
+  description: (source.description || '').trim(),
+  visibility: source.visibility || 'public',
+})
+
+const syncMetaForm = (source = image.value) => {
+  const snapshot = normalizeMeta(source)
+  metaForm.value = { ...snapshot }
+  originalMeta.value = { ...snapshot }
+}
+
+const isMetaDirty = computed(() => {
+  const current = normalizeMeta(metaForm.value || {})
+  const original = normalizeMeta(originalMeta.value || {})
+  return (
+    current.title !== original.title ||
+    current.description !== original.description ||
+    current.visibility !== original.visibility
+  )
+})
 
 const getFromQuery = () => (typeof route.query.from === 'string' ? route.query.from : '')
 const decodeFrom = (raw) => {
@@ -77,10 +103,16 @@ const onBack = () => {
 const changeZoom = (delta) => {
   zoom.value = Math.min(200, Math.max(50, zoom.value + delta))
 }
-const fitLabel = computed(() => (displayMode.value === 'fillWidth' ? '适应屏幕' : '宽度适配'))
-const fitScreen = () => {
-  displayMode.value = displayMode.value === 'fillWidth' ? 'fitScreen' : 'fillWidth'
+const fitLabel = computed(() => (viewMode.value === 'fitWidth' ? '适应屏幕' : '宽度适配'))
+const applyViewMode = async (mode = viewMode.value) => {
+  viewMode.value = mode
   zoom.value = 100
+  await nextTick()
+  updateStageSize()
+}
+const fitScreen = async () => {
+  const nextMode = viewMode.value === 'fitWidth' ? 'fitScreen' : 'fitWidth'
+  await applyViewMode(nextMode)
 }
 // 顶部动作：下载与删除
 const onDownload = () => {
@@ -110,8 +142,64 @@ const onDelete = async () => {
     ElMessage.error(err?.response?.data?.error || '删除失败')
   }
 }
-const onFieldChange = () => {
-  console.log('TODO: 保存元数据到后端', image.value)
+const startEditMeta = () => {
+  if (isEditingMeta.value) return
+  syncMetaForm(image.value)
+  isEditingMeta.value = true
+}
+const cancelEditMeta = () => {
+  if (!isEditingMeta.value) return
+  metaForm.value = { ...originalMeta.value }
+  isEditingMeta.value = false
+}
+const saveMeta = async () => {
+  if (!image.value.id || savingMeta.value) return false
+  savingMeta.value = true
+  const payload = {
+    title: metaForm.value.title?.trim(),
+    description: metaForm.value.description?.trim(),
+    visibility: metaForm.value.visibility,
+  }
+  try {
+    const { data } = await api.put(`/api/images/${image.value.id}`, payload)
+    const updated = data?.image || {}
+    image.value.title = updated.title ?? payload.title ?? ''
+    image.value.description = updated.description ?? payload.description ?? ''
+    if (updated.visibility != null) {
+      image.value.visibility = updated.visibility
+    } else if (payload.visibility != null) {
+      image.value.visibility = payload.visibility
+    }
+    syncMetaForm(image.value)
+    isEditingMeta.value = false
+    ElMessage.success('已保存修改')
+    await applyViewMode('fitScreen')
+    return true
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.error || '保存修改失败')
+    return false
+  } finally {
+    savingMeta.value = false
+  }
+}
+// Prompt to save/discard metadata edits before leaving the page.
+const confirmLeave = async () => {
+  if (!isEditingMeta.value || !isMetaDirty.value) return true
+  try {
+    await ElMessageBox.confirm('是否保存修改', '是否保存修改', {
+      confirmButtonText: '保存',
+      cancelButtonText: '不保存',
+      type: 'warning',
+      distinguishCancelAndClose: true,
+    })
+    return await saveMeta()
+  } catch (action) {
+    if (action === 'cancel') {
+      cancelEditMeta()
+      return true
+    }
+    return false
+  }
 }
 const removeTag = (tag) => {
   image.value.tags = image.value.tags.filter((t) => t !== tag)
@@ -215,7 +303,7 @@ const baseScale = computed(() => {
   const bw = bboxSize.value.w
   const bh = bboxSize.value.h
   if (!w || !h || !bw || !bh) return 1
-  if (displayMode.value === 'fitScreen') {
+  if (viewMode.value === 'fitScreen') {
     return Math.min(w / bw, h / bh) * 0.98
   }
   return w / bw
@@ -282,8 +370,7 @@ const updateStageSize = () => {
 const onPreviewLoad = async (e) => {
   const el = e.target
   imgNatural.value = { w: el.naturalWidth, h: el.naturalHeight }
-  await nextTick()
-  updateStageSize()
+  await applyViewMode(viewMode.value)
   imgLoading.value = false
 }
 
@@ -295,6 +382,9 @@ const loadDetail = async () => {
     imgLoading.value = true
     previewSrc.value = ''
     imgNatural.value = { w: 0, h: 0 }
+    viewMode.value = 'fitScreen'
+    zoom.value = 100
+    isEditingMeta.value = false
     const { data } = await api.get(`/api/images/${route.params.id}`)
     const picked = pickUrl(data)
     const stamp =
@@ -329,6 +419,7 @@ const loadDetail = async () => {
       tags: data.tags || [],
     }
     suggestedTags.value = data.suggested_tags || data.suggestedTags || []
+    syncMetaForm(image.value)
     previewSrc.value = absUrl
     await nextTick()
     updateStageSize()
@@ -377,6 +468,11 @@ onUnmounted(() => {
   }
 })
 
+onBeforeRouteLeave(async () => {
+  const ok = await confirmLeave()
+  if (!ok) return false
+})
+
 const goEdit = () => {
   const from = getFromQuery()
   const query = from ? { from } : {}
@@ -415,9 +511,9 @@ const goEdit = () => {
                 <el-button text :icon="FullScreen" @click="fitScreen">{{ fitLabel }}</el-button>
               </div>
             </div>
-            <div class="preview-body" :class="displayMode === 'fitScreen' ? 'fit-mode' : 'fill-mode'">
+            <div class="preview-body" :class="viewMode === 'fitScreen' ? 'fit-mode' : 'fill-mode'">
               <el-skeleton v-if="loading" :rows="6" animated style="width:100%;height:360px;" />
-              <div v-else ref="stageRef" class="img-stage" :class="displayMode === 'fitScreen' ? 'fit-mode' : 'fill-mode'">
+              <div v-else ref="stageRef" class="img-stage" :class="viewMode === 'fitScreen' ? 'fit-mode' : 'fill-mode'">
                 <div v-if="imgLoading" class="img-loading">
                   <el-skeleton :rows="4" animated style="width:240px;height:160px;" />
                 </div>
@@ -444,15 +540,20 @@ const goEdit = () => {
         <el-tabs v-model="activeTab" class="side-tabs">
           <el-tab-pane label="基本信息" name="basic">
             <div class="block">
-              <el-form label-width="68px" size="default" @change="onFieldChange">
+              <div class="meta-actions">
+                <el-button type="primary" :disabled="isEditingMeta" @click="startEditMeta">修改信息</el-button>
+                <el-button type="danger" :loading="savingMeta" :disabled="!isEditingMeta" @click="saveMeta">保存修改</el-button>
+                <el-button v-if="isEditingMeta" :disabled="savingMeta" @click="cancelEditMeta">取消修改</el-button>
+              </div>
+              <el-form label-width="68px" size="default" :model="metaForm">
                 <el-form-item label="标题">
-                  <el-input v-model="image.title" placeholder="输入标题" />
+                  <el-input v-model="metaForm.title" :disabled="!isEditingMeta" placeholder="输入标题" />
                 </el-form-item>
                 <el-form-item label="描述">
-                  <el-input v-model="image.description" type="textarea" :rows="3" placeholder="输入描述" />
+                  <el-input v-model="metaForm.description" :disabled="!isEditingMeta" type="textarea" :rows="3" placeholder="输入描述" />
                 </el-form-item>
                 <el-form-item label="可见性">
-                  <el-select v-model="image.visibility" placeholder="选择可见性" @change="onFieldChange">
+                  <el-select v-model="metaForm.visibility" :disabled="!isEditingMeta" placeholder="选择可见性">
                     <el-option v-for="opt in visibilityOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
                   </el-select>
                 </el-form-item>
@@ -773,6 +874,13 @@ const goEdit = () => {
 }
 .block {
   margin-bottom: 16px;
+}
+.meta-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
 }
 .block-title {
   font-weight: 600;
