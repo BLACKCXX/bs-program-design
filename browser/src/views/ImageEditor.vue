@@ -1,9 +1,10 @@
 <script setup>
-import { ref, computed, watch, onUnmounted, nextTick } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ref, reactive, computed, watch, onUnmounted, nextTick } from 'vue'
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, ZoomOut, ZoomIn, FullScreen, RefreshLeft, RefreshRight } from '@element-plus/icons-vue'
 import api from '../api/http'
+import { toDisplayUrl } from '../utils/url'
 
 const route = useRoute()
 const router = useRouter()
@@ -18,44 +19,132 @@ const emptyImage = {
 }
 
 const image = ref({ ...emptyImage })
-const workingImageId = ref(null)
-const workingUrl = ref('')
 const previewUrl = ref('')
 const previewKey = computed(() => `${previewUrl.value || 'empty'}`)
 const loading = ref(false)
-const previewLoading = ref(false)
-const ready = ref(false)
 const loadError = ref('')
 const blobUrl = ref('')
-const previewObjectUrl = ref('')
-const checkpointUrl = ref('')
+const previewLoading = ref(false)
+const previewRequestSeq = ref(0)
+const PREVIEW_TIMEOUT = 120000
+const PREVIEW_DEBOUNCE = 180
+let previewDebounceTimer = null
+
+const buildDefaultParams = () => ({
+  deg: 0,
+  crop_rect: null,
+  target_width: null,
+  target_height: null,
+  keep_ratio: false,
+  resize_mode: 'fit',
+  brightness: 0,
+  contrast: 0,
+  saturation: 0,
+  temperature: 0,
+  sharpness: 0,
+})
+const editParams = ref(buildDefaultParams())
+const previewAdjust = reactive({
+  brightness: 0,
+  contrast: 0,
+  saturation: 0,
+  temperature: 0,
+  sharpness: 0,
+})
+const suppressPreviewAdjustWatch = ref(false)
+
+const clampNumber = (val, min, max) => {
+  const num = Number(val) || 0
+  return Math.min(max, Math.max(min, num))
+}
+
+const buildAdjustValues = (source = {}) => ({
+  brightness: Number(source.brightness) || 0,
+  contrast: Number(source.contrast) || 0,
+  saturation: Number(source.saturation) || 0,
+  temperature: Number(source.temperature) || 0,
+  sharpness: Number(source.sharpness) || 0,
+})
+
+const normalizeAdjustValues = (source = {}) => ({
+  brightness: clampNumber(source.brightness, -100, 100),
+  contrast: clampNumber(source.contrast, -100, 100),
+  saturation: clampNumber(source.saturation, -100, 100),
+  temperature: clampNumber(source.temperature, -100, 100),
+  sharpness: clampNumber(source.sharpness, 0, 100),
+})
+
+const syncAdjustValues = (target, source = {}) => {
+  const next = normalizeAdjustValues(source)
+  target.brightness = next.brightness
+  target.contrast = next.contrast
+  target.saturation = next.saturation
+  target.temperature = next.temperature
+  target.sharpness = next.sharpness
+}
+
+const diffAdjustValues = (from, to) => {
+  const base = buildAdjustValues(from)
+  const next = buildAdjustValues(to)
+  return {
+    brightness: next.brightness - base.brightness,
+    contrast: next.contrast - base.contrast,
+    saturation: next.saturation - base.saturation,
+    temperature: next.temperature - base.temperature,
+    sharpness: next.sharpness - base.sharpness,
+  }
+}
+
+const hasAdjustDelta = (delta) =>
+  Boolean(
+    Number(delta.brightness) ||
+      Number(delta.contrast) ||
+      Number(delta.saturation) ||
+      Number(delta.temperature) ||
+      Number(delta.sharpness)
+  )
+
+const resetPreviewAdjust = (source = editParams.value) => {
+  suppressPreviewAdjustWatch.value = true
+  syncAdjustValues(previewAdjust, source)
+  nextTick(() => {
+    suppressPreviewAdjustWatch.value = false
+  })
+}
+
+const pendingAdjustDelta = computed(() => diffAdjustValues(editParams.value, previewAdjust))
+const hasPreviewAdjust = computed(() => hasAdjustDelta(pendingAdjustDelta.value))
+const historyStates = ref([JSON.parse(JSON.stringify(editParams.value))])
+const historyIndex = ref(0)
+const canUndo = computed(() => historyIndex.value > 0)
+const canRedo = computed(() => historyIndex.value < historyStates.value.length - 1)
 
 const zoom = ref(100)
 const changeZoom = (delta) => {
   const next = Math.min(200, Math.max(33, zoom.value + delta))
   if (next === zoom.value) return
   zoom.value = next
-  captureSnapshot()
 }
 const fitScreen = () => {
   if (zoom.value === 100) return
   zoom.value = 100
-  captureSnapshot()
 }
 
 const normalizeFilePath = (p = '') => {
   if (!p) return ''
-  let clean = String(p).replace(/\\/g, '/').replace(/^\/+/, '')
+  const raw = String(p).trim()
+  if (/^https?:\/\//i.test(raw) || raw.startsWith('blob:') || raw.startsWith('data:') || raw.startsWith('//')) {
+    return raw
+  }
+  const normalized = toDisplayUrl(raw)
+  let clean = normalized.replace(/\\/g, '/').replace(/^\/+/, '')
   clean = clean.replace(/^files\//, '')
-  return `/files/${encodeURI(clean)}`
-}
-
-const buildVersionedUrl = (rawUrl, stamp = Date.now()) => {
-  if (!rawUrl) return ''
-  return `${normalizeFilePath(rawUrl)}?v=${stamp}`
+  return toDisplayUrl(`/files/${encodeURI(clean)}`)
 }
 
 const pickUrl = (data = {}) =>
+  data.absolute_url ||
+  data.absoluteUrl ||
   data.url ||
   data.cover_url ||
   data.thumb_url ||
@@ -64,29 +153,113 @@ const pickUrl = (data = {}) =>
   data.thumb ||
   ''
 
-const fetchPreviewBlob = async (url, asBase = false) => {
+const resolveError = (err, fallback = '请求失败') =>
+  err?.response?.data?.error || err?.response?.data?.detail || err?.message || fallback
+
+const cloneParams = (params) => JSON.parse(JSON.stringify(params))
+
+const isDefaultParams = (params) => {
+  if (!params) return true
+  const crop = params.crop_rect
+  const cropW = crop ? Number(crop.w ?? crop.width) : 0
+  const cropH = crop ? Number(crop.h ?? crop.height) : 0
+  const resizeMode = (params.resize_mode || 'fit').toLowerCase()
+  return (
+    !Number(params.deg) &&
+    !(cropW || cropH) &&
+    !Number(params.target_width) &&
+    !Number(params.target_height) &&
+    !Boolean(params.keep_ratio) &&
+    resizeMode === 'fit' &&
+    !Number(params.brightness) &&
+    !Number(params.contrast) &&
+    !Number(params.saturation) &&
+    !Number(params.temperature) &&
+    !Number(params.sharpness)
+  )
+}
+
+const buildPreviewPayload = (options = {}) => {
+  const payload = cloneParams(editParams.value)
+  const usePreviewAdjust = options.usePreviewAdjust !== false
+  if (usePreviewAdjust) {
+    const adjust = normalizeAdjustValues(previewAdjust)
+    payload.brightness = adjust.brightness
+    payload.contrast = adjust.contrast
+    payload.saturation = adjust.saturation
+    payload.temperature = adjust.temperature
+    payload.sharpness = adjust.sharpness
+  }
+  return payload
+}
+
+const resetPreviewToBase = () => {
+  previewRequestSeq.value += 1
+  if (blobUrl.value) {
+    URL.revokeObjectURL(blobUrl.value)
+    blobUrl.value = ''
+  }
+  previewUrl.value = image.value.url || ''
+  previewLoading.value = false
+}
+
+// Guard against stale preview responses when users click quickly.
+const renderPreview = async (options = {}) => {
+  if (!image.value.id) return
+  const payload = buildPreviewPayload(options)
+  if (isDefaultParams(payload)) {
+    resetPreviewToBase()
+    return
+  }
+  const seq = ++previewRequestSeq.value
+  previewLoading.value = true
   try {
-    const resp = await api.get(url, { responseType: 'blob' })
-    if (blobUrl.value) URL.revokeObjectURL(blobUrl.value)
+    const resp = await api.post(`/api/images/${image.value.id}/preview`, payload, {
+      responseType: 'blob',
+      timeout: PREVIEW_TIMEOUT,
+    })
+    if (seq !== previewRequestSeq.value) {
+      if (resp?.data) {
+        const tmpUrl = URL.createObjectURL(resp.data)
+        URL.revokeObjectURL(tmpUrl)
+      }
+      return
+    }
+    if (blobUrl.value) {
+      URL.revokeObjectURL(blobUrl.value)
+      blobUrl.value = ''
+    }
     blobUrl.value = URL.createObjectURL(resp.data)
     previewUrl.value = blobUrl.value
-    if (asBase) {
-      workingUrl.value = blobUrl.value
-    }
   } catch (err) {
-    console.error('[editor] blob fetch failed', url, err)
-    ElMessage.error('图片加载失败')
+    if (seq !== previewRequestSeq.value) return
+    console.error('[editor] preview render failed', err)
+    ElMessage.warning('预览生成失败，可继续编辑或重试')
+    resetPreviewToBase()
+  } finally {
+    if (seq === previewRequestSeq.value) {
+      previewLoading.value = false
+    }
   }
 }
 
-const onImgError = async (e) => {
-  const badUrl = e?.target?.src
-  console.error('[editor] load error', badUrl)
-  if (badUrl && badUrl.startsWith('blob:')) return
-  const fallbackUrl = workingUrl.value || image.value.url
-  if (fallbackUrl) {
-    await fetchPreviewBlob(fallbackUrl, true)
+const schedulePreview = (options = {}) => {
+  if (previewDebounceTimer) {
+    clearTimeout(previewDebounceTimer)
   }
+  previewDebounceTimer = setTimeout(() => {
+    previewDebounceTimer = null
+    renderPreview(options)
+  }, PREVIEW_DEBOUNCE)
+}
+
+const onImgError = () => {
+  const fallbackUrl = image.value.url || ''
+  if (fallbackUrl && previewUrl.value !== fallbackUrl) {
+    resetPreviewToBase()
+    return
+  }
+  loadError.value = loadError.value || '图片加载失败'
 }
 
 const getFromQuery = () => (typeof route.query.from === 'string' ? route.query.from : '')
@@ -97,75 +270,98 @@ const buildDetailQuery = (stamp = Date.now()) => {
   return query
 }
 
-const loadDetail = async () => {
-  try {
-    loading.value = true
-    ready.value = false
-    loadError.value = ''
-    previewUrl.value = ''
-    previewSeq += 1
-    endScaleDrag()
-    const { data } = await api.get(`/api/images/${route.params.id}`)
-    const picked = pickUrl(data)
-    const stamp =
-      data.updated_at ||
-      data.updatedAt ||
-      data.updated ||
-      data.created_at ||
-      data.createdAt
-    const versionTag = stamp ? new Date(stamp).getTime() || Date.now() : Date.now()
-    const absUrl = picked ? `${normalizeFilePath(picked)}?v=${versionTag}` : ''
-    image.value = {
-      ...emptyImage,
-      ...data,
-      url: absUrl,
-    }
-    workingImageId.value = data?.id || route.params.id
-    workingUrl.value = absUrl
-    previewUrl.value = absUrl
-    checkpointUrl.value = absUrl
-    if (blobUrl.value) {
-      URL.revokeObjectURL(blobUrl.value)
-      blobUrl.value = ''
-    }
-    if (previewObjectUrl.value) {
-      URL.revokeObjectURL(previewObjectUrl.value)
-      previewObjectUrl.value = ''
-    }
-    imgNatural.value = { w: 0, h: 0 }
-    cropRect.value = { x: 0, y: 0, width: 0, height: 0 }
-    isCropping.value = false
-    isScaling.value = false
-    scaleRect.value = { width: 0, height: 0 }
-    scaleBase.value = { w: 0, h: 0 }
-    zoom.value = 100
-    brightness.value = 0
-    contrast.value = 0
-    saturation.value = 0
-    warmth.value = 0
-    sharpen.value = 0
-    resetHistory()
-    exportName.value = image.value.title || ''
-  } catch (err) {
-    ElMessage.error(err?.response?.data?.error || '加载图片详情失败')
-    loadError.value = err?.response?.data?.error || err?.message || '加载失败'
+const pushHistory = () => {
+  const snapshot = cloneParams(editParams.value)
+  const current = historyStates.value[historyIndex.value]
+  if (current && JSON.stringify(snapshot) === JSON.stringify(current)) return false
+  if (historyIndex.value < historyStates.value.length - 1) {
+    historyStates.value = historyStates.value.slice(0, historyIndex.value + 1)
   }
+  historyStates.value.push(snapshot)
+  historyIndex.value = historyStates.value.length - 1
+  return true
+}
+
+const applyHistoryState = (state) => {
+  editParams.value = cloneParams(state)
+  resetPreviewAdjust()
+}
+
+const resetHistory = () => {
+  historyStates.value = [cloneParams(editParams.value)]
+  historyIndex.value = 0
+}
+
+const undo = async () => {
+  if (!canUndo.value) return
+  historyIndex.value -= 1
+  applyHistoryState(historyStates.value[historyIndex.value])
+  isCropping.value = false
+  isScaling.value = false
+  await renderPreview()
+}
+
+const redo = async () => {
+  if (!canRedo.value) return
+  historyIndex.value += 1
+  applyHistoryState(historyStates.value[historyIndex.value])
+  isCropping.value = false
+  isScaling.value = false
+  await renderPreview()
+}
+
+const loadDetail = async () => {
+  loading.value = true
+  loadError.value = ''
+  previewUrl.value = ''
+  endScaleDrag()
+  previewLoading.value = false
+
+  let data = null
+  try {
+    const resp = await api.get(`/api/images/${route.params.id}`)
+    data = resp.data
+  } catch (err) {
+    const msg = resolveError(err, '加载图片详情失败')
+    loadError.value = `[detail] ${msg}`
+    ElMessage.error(msg)
+    loading.value = false
+    return
+  }
+
+  const picked = pickUrl(data)
+  const stamp =
+    data.updated_at ||
+    data.updatedAt ||
+    data.updated ||
+    data.created_at ||
+    data.createdAt
+  const versionTag = stamp ? new Date(stamp).getTime() || Date.now() : Date.now()
+  const absUrl = picked ? `${normalizeFilePath(picked)}?v=${versionTag}` : ''
+  image.value = {
+    ...emptyImage,
+    ...data,
+    url: absUrl,
+  }
+  resetPreviewToBase()
+  editParams.value = buildDefaultParams()
+  resetHistory()
+  resetPreviewAdjust()
+  imgNatural.value = { w: 0, h: 0 }
+  cropRect.value = { x: 0, y: 0, width: 0, height: 0 }
+  isCropping.value = false
+  isScaling.value = false
+  scaleRect.value = { width: 0, height: 0 }
+  scaleBase.value = { w: 0, h: 0 }
+  zoom.value = 100
+  exportName.value = image.value.title || ''
   loading.value = false
-  ready.value = true
 }
 
 // ---- 编辑状态 ----
 const isCropping = ref(false)
 const cropRect = ref({ x: 0, y: 0, width: 0, height: 0 })
 const dragState = ref(null)
-const history = ref([])
-const redoStack = ref([])
-
-const brightness = ref(0)
-const contrast = ref(0)
-const saturation = ref(0)
-const warmth = ref(0)
-const sharpen = ref(0)
 
 const MIN_SCALE_PX = 16
 const MAX_SCALE_PX = 8192
@@ -181,8 +377,6 @@ const imgBox = ref({ w: 0, h: 0 })
 const stageRef = ref(null)
 const stageSize = ref({ w: 0, h: 0 })
 let stageObserver = null
-let previewTimer = null
-let previewSeq = 0
 
 const bboxSize = computed(() => {
   const w = imgNatural.value.w
@@ -262,6 +456,20 @@ const onEditorImgLoad = async (e) => {
   syncImgBox()
 }
 
+watch(
+  () => [
+    previewAdjust.brightness,
+    previewAdjust.contrast,
+    previewAdjust.saturation,
+    previewAdjust.temperature,
+    previewAdjust.sharpness,
+  ],
+  () => {
+    if (suppressPreviewAdjustWatch.value) return
+    schedulePreview({ usePreviewAdjust: true })
+  }
+)
+
 watch([zoom, isCropping, isScaling], async () => {
   await nextTick()
   syncImgBox()
@@ -288,203 +496,16 @@ onUnmounted(() => {
     stageObserver.disconnect()
     stageObserver = null
   }
-  if (previewTimer) {
-    clearTimeout(previewTimer)
-    previewTimer = null
+  if (previewDebounceTimer) {
+    clearTimeout(previewDebounceTimer)
+    previewDebounceTimer = null
   }
   if (blobUrl.value) {
     URL.revokeObjectURL(blobUrl.value)
     blobUrl.value = ''
   }
-  if (previewObjectUrl.value) {
-    URL.revokeObjectURL(previewObjectUrl.value)
-    previewObjectUrl.value = ''
-  }
 })
 
-const clearPreviewObjectUrl = () => {
-  if (previewObjectUrl.value) {
-    URL.revokeObjectURL(previewObjectUrl.value)
-    previewObjectUrl.value = ''
-  }
-}
-
-const resetPreviewToBase = () => {
-  clearPreviewObjectUrl()
-  if (workingUrl.value) {
-    previewUrl.value = workingUrl.value
-  }
-}
-
-// 进入裁剪/缩放模式时保存当前工作图，取消时可回滚
-const saveCheckpoint = () => {
-  checkpointUrl.value = workingUrl.value
-}
-const restoreCheckpoint = () => {
-  if (checkpointUrl.value && checkpointUrl.value !== workingUrl.value) {
-    workingUrl.value = checkpointUrl.value
-    previewUrl.value = checkpointUrl.value
-    clearPreviewObjectUrl()
-  }
-}
-
-const buildPreviewPayload = () => ({
-  brightness: brightness.value,
-  contrast: contrast.value,
-  saturation: saturation.value,
-  warmth: warmth.value,
-  sharpen: sharpen.value,
-})
-
-const hasPreviewEdits = (payload) => {
-  const hasAdjust =
-    Number(payload.brightness) ||
-    Number(payload.contrast) ||
-    Number(payload.saturation) ||
-    Number(payload.warmth) ||
-    Number(payload.sharpen)
-  return !!hasAdjust
-}
-
-const schedulePreview = () => {
-  if (!ready.value) return
-  if (previewTimer) clearTimeout(previewTimer)
-  previewTimer = setTimeout(() => refreshPreview(), 260)
-}
-
-const refreshPreview = async () => {
-  const targetId = workingImageId.value || image.value.id || route.params.id
-  if (!ready.value || !targetId) return
-  const payload = buildPreviewPayload()
-  if (!hasPreviewEdits(payload)) {
-    resetPreviewToBase()
-    return
-  }
-  previewLoading.value = true
-  const seq = ++previewSeq
-  try {
-    const { data } = await api.post(`/api/images/${targetId}/preview`, payload, { responseType: 'blob' })
-    if (seq !== previewSeq) return
-    clearPreviewObjectUrl()
-    previewObjectUrl.value = URL.createObjectURL(data)
-    previewUrl.value = previewObjectUrl.value
-  } catch (err) {
-    console.error('[editor] preview failed', err)
-    ElMessage.error(err?.response?.data?.error || '预览生成失败')
-  } finally {
-    if (seq === previewSeq) {
-      previewLoading.value = false
-    }
-  }
-}
-
-const applyEditAndSync = async (payload) => {
-  const targetId = workingImageId.value || image.value.id || route.params.id
-  const { data } = await api.post(`/api/images/${targetId}/edit`, payload)
-  const nextId = data?.image_id || targetId
-  const stamp = data?.updatedAt ? new Date(data.updatedAt).getTime() || Date.now() : Date.now()
-  const nextUrl = data?.url ? buildVersionedUrl(data.url, stamp) : workingUrl.value
-
-  workingImageId.value = nextId
-  image.value.id = nextId
-  if (nextUrl) {
-    workingUrl.value = nextUrl
-    previewUrl.value = nextUrl
-    image.value.url = nextUrl
-  }
-  checkpointUrl.value = workingUrl.value
-  previewSeq += 1
-  clearPreviewObjectUrl()
-  imgNatural.value = { w: 0, h: 0 }
-  await nextTick()
-  updateStageSize()
-  syncImgBox()
-  return { nextId, stamp, nextUrl, mode: data?.mode }
-}
-
-watch([brightness, contrast, saturation, warmth, sharpen], () => {
-  if (!ready.value) return
-  schedulePreview()
-})
-
-const snapshotState = () => ({
-  zoom: zoom.value,
-  brightness: brightness.value,
-  contrast: contrast.value,
-  saturation: saturation.value,
-  warmth: warmth.value,
-  sharpen: sharpen.value,
-  cropRect: cropRect.value ? { ...cropRect.value } : null,
-  isScaling: isScaling.value,
-  scaleRect: scaleRect.value ? { ...scaleRect.value } : null,
-  scaleBase: scaleBase.value ? { ...scaleBase.value } : null,
-})
-
-const isSameSnapshot = (a, b) => {
-  if (!a || !b) return false
-  const rectEqual = (left, right) => JSON.stringify(left || null) === JSON.stringify(right || null)
-  return (
-    a.zoom === b.zoom &&
-    a.brightness === b.brightness &&
-    a.contrast === b.contrast &&
-    a.saturation === b.saturation &&
-    a.warmth === b.warmth &&
-    a.sharpen === b.sharpen &&
-    a.isScaling === b.isScaling &&
-    rectEqual(a.cropRect, b.cropRect) &&
-    rectEqual(a.scaleRect, b.scaleRect) &&
-    rectEqual(a.scaleBase, b.scaleBase)
-  )
-}
-
-const resetHistory = () => {
-  history.value = [snapshotState()]
-  redoStack.value = []
-}
-
-const captureSnapshot = () => {
-  const snapshot = snapshotState()
-  const last = history.value[history.value.length - 1]
-  if (last && isSameSnapshot(last, snapshot)) return
-  history.value.push(snapshot)
-  redoStack.value = []
-}
-
-const applySnapshot = (snapshot) => {
-  if (!snapshot) return
-  zoom.value = snapshot.zoom ?? zoom.value
-  brightness.value = snapshot.brightness ?? brightness.value
-  contrast.value = snapshot.contrast ?? contrast.value
-  saturation.value = snapshot.saturation ?? saturation.value
-  warmth.value = snapshot.warmth ?? warmth.value
-  sharpen.value = snapshot.sharpen ?? sharpen.value
-  // Null-safe restore to avoid spreading a null cropRect snapshot.
-  cropRect.value = snapshot.cropRect ? { ...snapshot.cropRect } : null
-  isScaling.value = snapshot.isScaling ?? false
-  scaleRect.value = snapshot.scaleRect ? { ...snapshot.scaleRect } : { ...scaleRect.value }
-  scaleBase.value = snapshot.scaleBase ? { ...snapshot.scaleBase } : { ...scaleBase.value }
-  isCropping.value = false
-  refreshPreview()
-}
-
-const canUndo = computed(() => history.value.length > 1)
-const canRedo = computed(() => redoStack.value.length > 0)
-
-const undo = () => {
-  if (!canUndo.value) return
-  const current = history.value.pop()
-  if (current) redoStack.value.push(current)
-  const prev = history.value[history.value.length - 1]
-  applySnapshot(prev)
-}
-
-const redo = () => {
-  if (!canRedo.value) return
-  const next = redoStack.value.pop()
-  if (!next) return
-  history.value.push(next)
-  applySnapshot(next)
-}
 
 watch(
   () => route.params.id,
@@ -496,7 +517,6 @@ watch(
 
 const toggleCropMode = () => {
   if (!isCropping.value) {
-    saveCheckpoint()
     isScaling.value = false
     isCropping.value = true
     cropRect.value = { x: 0, y: 0, width: 0, height: 0 }
@@ -511,7 +531,6 @@ const toggleCropMode = () => {
 const cancelCrop = () => {
   isCropping.value = false
   initCropRect()
-  restoreCheckpoint()
 }
 
 const clampCropRect = (rect, natural) => {
@@ -537,31 +556,55 @@ const applyRotate = async (delta) => {
     ElMessage.warning('请先应用或取消当前操作')
     return
   }
-  rotateLoading.value = true
-  try {
-    // 旋转为像素级更新，避免后续操作回到原图
-    await applyEditAndSync({ mode: 'override', rotate: delta })
-    ElMessage.success(delta > 0 ? '已顺时针旋转90°' : '已逆时针旋转90°')
-  } catch (err) {
-    ElMessage.error(err?.response?.data?.error || '旋转失败')
-  } finally {
-    rotateLoading.value = false
+  if (previewLoading.value) {
+    ElMessage.info('正在生成预览，请稍后')
+    return
   }
+  rotateLoading.value = true
+  const nextDeg = (Number(editParams.value.deg) || 0) + delta
+  editParams.value.deg = ((nextDeg % 360) + 360) % 360
+  pushHistory()
+  await renderPreview()
+  ElMessage.success(delta > 0 ? '已顺时针旋转90°' : '已逆时针旋转90°')
+  rotateLoading.value = false
 }
 
 const resetAdjust = async () => {
-  brightness.value = 0
-  contrast.value = 0
-  saturation.value = 0
-  warmth.value = 0
-  sharpen.value = 0
-  isCropping.value = false
-  isScaling.value = false
-  scaleRect.value = { width: 0, height: 0 }
-  scaleBase.value = { w: 0, h: 0 }
-  initCropRect()
-  await refreshPreview()
-  captureSnapshot()
+  if (previewLoading.value) {
+    ElMessage.info('正在生成预览，请稍后')
+    return
+  }
+  editParams.value.brightness = 0
+  editParams.value.contrast = 0
+  editParams.value.saturation = 0
+  editParams.value.temperature = 0
+  editParams.value.sharpness = 0
+  resetPreviewAdjust()
+  pushHistory()
+  await renderPreview()
+  ElMessage.success('已重置调节')
+}
+
+const applyAdjust = async () => {
+  if (previewLoading.value) {
+    ElMessage.info('正在生成预览，请稍后')
+    return
+  }
+  const payload = normalizeAdjustValues(previewAdjust)
+  const delta = diffAdjustValues(editParams.value, payload)
+  if (!hasAdjustDelta(delta)) {
+    ElMessage.info('当前没有可应用的调节')
+    return
+  }
+  editParams.value.brightness = payload.brightness
+  editParams.value.contrast = payload.contrast
+  editParams.value.saturation = payload.saturation
+  editParams.value.temperature = payload.temperature
+  editParams.value.sharpness = payload.sharpness
+  resetPreviewAdjust(editParams.value)
+  pushHistory()
+  await renderPreview()
+  ElMessage.success('已应用调节')
 }
 
 const scaleLoading = ref(false)
@@ -572,7 +615,6 @@ const startScaleMode = async () => {
     ElMessage.warning('无法获取图片尺寸')
     return
   }
-  saveCheckpoint()
   isCropping.value = false
   scaleBase.value = { w: natural.w, h: natural.h }
   scaleRect.value = { width: natural.w, height: natural.h }
@@ -587,7 +629,6 @@ const cancelScale = async () => {
   scaleRect.value = { width: scaleBase.value.w, height: scaleBase.value.h }
   await nextTick()
   syncImgBox()
-  restoreCheckpoint()
 }
 
 const applyScale = async () => {
@@ -596,6 +637,10 @@ const applyScale = async () => {
     return
   }
   if (scaleLoading.value) return
+  if (previewLoading.value) {
+    ElMessage.info('正在生成预览，请稍后')
+    return
+  }
   const base = scaleBase.value
   if (!base.w || !base.h) {
     ElMessage.warning('无法获取图片尺寸')
@@ -613,34 +658,20 @@ const applyScale = async () => {
   }
 
   scaleLoading.value = true
-  try {
-    const payload = {
-      mode: 'override',
-      // 后端 Pillow 使用 LANCZOS 重采样，确保像素级缩放（stretch）
-      target_width: targetW,
-      target_height: targetH,
-      keep_ratio: false,
-      resize_mode: 'stretch',
-    }
-    await applyEditAndSync(payload)
-    image.value.width = targetW
-    image.value.height = targetH
-    isScaling.value = false
-    scaleBase.value = { w: targetW, h: targetH }
-    scaleRect.value = { width: targetW, height: targetH }
-    captureSnapshot()
-    await refreshPreview()
-    ElMessage.success('已应用缩放')
-  } catch (err) {
-    ElMessage.error(err?.response?.data?.error || '缩放失败')
-  } finally {
-    scaleLoading.value = false
-  }
+  editParams.value.target_width = targetW
+  editParams.value.target_height = targetH
+  editParams.value.keep_ratio = false
+  pushHistory()
+  await renderPreview()
+  isScaling.value = false
+  scaleBase.value = { w: targetW, h: targetH }
+  scaleRect.value = { width: targetW, height: targetH }
+  ElMessage.success('已应用缩放')
+  scaleLoading.value = false
 }
 
 function startScaleDrag(evt, handle) {
   if (!isScaling.value || !scaleBase.value.w || !scaleBase.value.h) return
-  captureSnapshot()
   scaleDragState.value = {
     handle,
     startX: evt.clientX,
@@ -694,9 +725,6 @@ function endScaleDrag() {
   window.removeEventListener('mousemove', onScaleDrag)
   window.removeEventListener('mouseup', endScaleDrag)
   scaleDragState.value = null
-  if (isScaling.value) {
-    captureSnapshot()
-  }
 }
 
 const cropLoading = ref(false)
@@ -706,30 +734,23 @@ const applyCrop = async () => {
     return
   }
   if (cropLoading.value) return
+  if (previewLoading.value) {
+    ElMessage.info('正在生成预览，请稍后')
+    return
+  }
   const rect = mapCropToBase(cropRect.value)
   if (!rect?.width || !rect?.height) {
     ElMessage.warning('请先调整裁剪框大小')
     return
   }
   cropLoading.value = true
-  try {
-    const payload = {
-      mode: 'override',
-      crop_rect: rect,
-    }
-    await applyEditAndSync(payload)
-    image.value.width = Math.round(rect.width)
-    image.value.height = Math.round(rect.height)
-    isCropping.value = false
-    initCropRect()
-    captureSnapshot()
-    await refreshPreview()
-    ElMessage.success('已应用裁剪')
-  } catch (err) {
-    ElMessage.error(err?.response?.data?.error || '裁剪失败')
-  } finally {
-    cropLoading.value = false
-  }
+  editParams.value.crop_rect = { x: rect.x, y: rect.y, w: rect.width, h: rect.height }
+  pushHistory()
+  await renderPreview()
+  isCropping.value = false
+  initCropRect()
+  ElMessage.success('已应用裁剪')
+  cropLoading.value = false
 }
 
 const buildRectStyle = (rect) => {
@@ -757,7 +778,6 @@ const scaleInfo = computed(() => {
 
 const startDrag = (evt, mode) => {
   if (!isCropping.value || !imgBox.value.w) return
-  captureSnapshot()
   dragState.value = {
     mode,
     startX: evt.clientX,
@@ -805,7 +825,6 @@ const endDrag = () => {
   window.removeEventListener('mousemove', onDrag)
   window.removeEventListener('mouseup', endDrag)
   dragState.value = null
-  captureSnapshot()
 }
 
 const exportMode = ref('override')
@@ -815,21 +834,30 @@ const onExport = async () => {
     ElMessage.warning('请先输入导出名称')
     return
   }
-  const cropPayload = isCropping.value ? mapCropToBase(cropRect.value) : null
-  const payload = {
-    mode: exportMode.value,
-    exportName: exportName.value || image.value.title,
-    brightness: brightness.value,
-    contrast: contrast.value,
-    saturation: saturation.value,
-    warmth: warmth.value,
-    sharpen: sharpen.value,
-    crop_rect: cropPayload,
+  if (previewLoading.value) {
+    ElMessage.info('正在生成预览，请稍后')
+    return
+  }
+  if (isCropping.value || isScaling.value) {
+    ElMessage.warning('请先应用或取消当前操作')
+    return
+  }
+  if (hasPreviewAdjust.value) {
+    ElMessage.warning('请先应用或重置调节')
+    return
   }
   try {
-    const targetId = workingImageId.value || image.value.id || route.params.id
-    const { data } = await api.post(`/api/images/${targetId}/edit`, payload)
-    const nextId = data?.image_id || targetId
+    const imageId = image.value.id || route.params.id
+    const payload = {
+      ...cloneParams(editParams.value),
+      mode: exportMode.value,
+    }
+    const trimmedName = exportName.value.trim()
+    if (trimmedName) {
+      payload.exportName = trimmedName
+    }
+    const { data } = await api.post(`/api/images/${imageId}/edit`, payload)
+    const nextId = data?.image_id || imageId
     const stamp = data?.updatedAt ? new Date(data.updatedAt).getTime() || Date.now() : Date.now()
     ElMessage.success('导出成功')
     router.push({ name: 'ImageDetail', params: { id: nextId }, query: buildDetailQuery(stamp) })
@@ -838,13 +866,79 @@ const onExport = async () => {
   }
 }
 
+const promptCommitMode = async () => {
+  const overrideName = exportName.value.trim()
+  try {
+    await ElMessageBox.confirm('请选择保存方式', '保存图片', {
+      confirmButtonText: '覆盖原图',
+      cancelButtonText: '导出新图',
+      distinguishCancelAndClose: true,
+    })
+    return { mode: 'override', exportName: overrideName || undefined }
+  } catch (action) {
+    if (action !== 'cancel') return null
+    try {
+      const { value } = await ElMessageBox.prompt('请输入导出名称', '导出新图', {
+        inputPlaceholder: image.value.title || '未命名',
+        inputValidator: (val) => (!!val && !!val.trim()) || '请输入导出名称',
+      })
+      return { mode: 'new', exportName: value.trim() }
+    } catch {
+      return null
+    }
+  }
+}
+
+const confirmLeave = async () => {
+  if (isCropping.value || isScaling.value) {
+    ElMessage.warning('请先应用或取消当前操作')
+    return false
+  }
+  if (hasPreviewAdjust.value) {
+    ElMessage.warning('请先应用或重置调节')
+    return false
+  }
+  const hasEdits = historyIndex.value > 0
+  if (!hasEdits) return true
+  try {
+    await ElMessageBox.confirm('是否保存修改后的图片', '是否保存修改后的图片', {
+      confirmButtonText: '保存',
+      cancelButtonText: '不保存',
+      type: 'warning',
+      distinguishCancelAndClose: true,
+    })
+    const commitPayload = await promptCommitMode()
+    if (!commitPayload) return false
+    const imageId = image.value.id || route.params.id
+    const payload = {
+      ...cloneParams(editParams.value),
+      mode: commitPayload.mode,
+    }
+    if (commitPayload.exportName) {
+      payload.exportName = commitPayload.exportName
+    }
+    await api.post(`/api/images/${imageId}/edit`, payload)
+    return true
+  } catch (action) {
+    if (action === 'cancel') {
+      return true
+    }
+    return false
+  }
+}
+
 const goBack = () => {
   router.push({
     name: 'ImageDetail',
-    params: { id: workingImageId.value || route.params.id },
+    params: { id: image.value.id || route.params.id },
     query: buildDetailQuery(),
   })
 }
+
+onBeforeRouteLeave(async () => {
+  const ok = await confirmLeave()
+  if (!ok) return false
+})
 </script>
 
 <template>
@@ -855,6 +949,8 @@ const goBack = () => {
         <span>返回</span>
       </el-button>
       <span class="title">图片编辑 · {{ image.title || '未命名' }}</span>
+      <el-tag v-if="previewLoading" size="small" type="warning" effect="plain">正在生成预览...</el-tag>
+      <el-tag v-else size="small" type="success" effect="plain">编辑已就绪</el-tag>
     </header>
 
     <section class="editor-layout">
@@ -931,7 +1027,7 @@ const goBack = () => {
             <div class="panel-title">裁剪</div>
             <div class="ratio-row crop-actions">
               <el-button size="small" :type="isCropping ? 'primary' : 'default'" :disabled="isCropping" @click="toggleCropMode">裁剪</el-button>
-              <el-button size="small" type="primary" @click="applyCrop" :disabled="!isCropping" :loading="cropLoading">应用裁剪</el-button>
+              <el-button size="small" type="primary" @click="applyCrop" :disabled="!isCropping || previewLoading" :loading="cropLoading">应用裁剪</el-button>
               <el-button size="small" @click="cancelCrop" :disabled="!isCropping">取消裁剪</el-button>
             </div>
           </div>
@@ -940,7 +1036,7 @@ const goBack = () => {
             <div class="panel-title">缩放</div>
             <div class="ratio-row scale-actions">
               <el-button size="small" :type="isScaling ? 'primary' : 'default'" :disabled="isScaling" @click="startScaleMode">缩放</el-button>
-              <el-button size="small" type="primary" :loading="scaleLoading" :disabled="!isScaling" @click="applyScale">应用缩放</el-button>
+              <el-button size="small" type="primary" :loading="scaleLoading" :disabled="!isScaling || previewLoading" @click="applyScale">应用缩放</el-button>
               <el-button size="small" :disabled="!isScaling" @click="cancelScale">取消缩放</el-button>
             </div>
             <div v-if="isScaling && scaleInfo" class="scale-info">目标尺寸：{{ scaleInfo }} px</div>
@@ -958,25 +1054,27 @@ const goBack = () => {
             <div class="panel-title">调节</div>
             <div class="slider-row">
               <span>亮度</span>
-              <el-slider v-model="brightness" :min="-100" :max="100" @change="captureSnapshot" />
+              <el-slider v-model="previewAdjust.brightness" :min="-100" :max="100" />
             </div>
             <div class="slider-row">
               <span>对比度</span>
-              <el-slider v-model="contrast" :min="-100" :max="100" @change="captureSnapshot" />
+              <el-slider v-model="previewAdjust.contrast" :min="-100" :max="100" />
             </div>
             <div class="slider-row">
               <span>饱和度</span>
-              <el-slider v-model="saturation" :min="-100" :max="100" @change="captureSnapshot" />
+              <el-slider v-model="previewAdjust.saturation" :min="-100" :max="100" />
             </div>
             <div class="slider-row">
               <span>色温</span>
-              <el-slider v-model="warmth" :min="-100" :max="100" :step="1" show-input @change="captureSnapshot" />
+              <el-slider v-model="previewAdjust.temperature" :min="-100" :max="100" :step="1" show-input />
             </div>
             <div class="slider-row">
               <span>锐化</span>
-              <el-slider v-model="sharpen" :min="0" :max="100" :step="1" show-input @change="captureSnapshot" />
+              <el-slider v-model="previewAdjust.sharpness" :min="0" :max="100" :step="1" show-input />
             </div>
+            <div class="adjust-hint">调节会生成预览，应用后保存</div>
             <div class="slider-row reset-row">
+              <el-button size="small" type="primary" :disabled="previewLoading" @click="applyAdjust">应用调节</el-button>
               <el-button size="small" @click="resetAdjust">重置所有调节</el-button>
             </div>
           </div>
@@ -1230,6 +1328,12 @@ const goBack = () => {
 .slider-row span {
   width: 60px;
   color: #1f6feb;
+}
+.adjust-hint {
+  padding-left: 60px;
+  font-size: 12px;
+  color: #6b7280;
+  margin-bottom: 6px;
 }
 .scale-info {
   margin-top: 6px;

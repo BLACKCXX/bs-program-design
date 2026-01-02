@@ -29,6 +29,7 @@ const messagesEl = ref(null)
 const allTags = ref([])
 const loadingTags = ref(false)
 const requestId = ref(0)
+const explainLoading = ref({})
 
 const appendMessage = (payload, { persist = true } = {}) => {
   const msg = workspaceStore.pushMessage(payload)
@@ -130,7 +131,14 @@ const refreshTagSuggestions = (query = '', results = []) => {
 const scrollToBottom = async () => {
   await nextTick()
   const el = messagesEl.value
-  if (el) el.scrollTop = el.scrollHeight
+  if (!el) return
+  const wrap = el.wrapRef || el.$el?.querySelector('.el-scrollbar__wrap') || el
+  const max = wrap?.scrollHeight || 0
+  if (typeof el.setScrollTop === 'function') {
+    el.setScrollTop(max)
+    return
+  }
+  if ('scrollTop' in wrap) wrap.scrollTop = max
 }
 
 const discardTyping = () => {
@@ -162,7 +170,7 @@ const removeMessage = (msg) => {
 const clearMessages = async () => {
   if (!messages.value.length) return
   try {
-    await ElMessageBox.confirm('确认清空所有对话记录吗？', '清空记录', {
+    await ElMessageBox.confirm('确定要清空当前聊天记录吗？清空后不可恢复。', '清空聊天记录', {
       confirmButtonText: '清空',
       cancelButtonText: '取消',
       type: 'warning',
@@ -201,6 +209,53 @@ const normalizeResult = (item = {}) => {
   }
 }
 
+const buildExplainMessage = (items = []) => {
+  if (!items.length) return '暂时没有可讲解的图片。'
+  const lines = ['我对这几张图做了内容分析，重点如下：']
+  items.forEach((item, index) => {
+    const title = (item?.title || '').trim() || `图片 ${index + 1}`
+    lines.push(`${index + 1}）${title}`)
+    if (item?.explanation) {
+      lines.push(`讲解：${item.explanation}`)
+    }
+    const highlights = Array.isArray(item?.highlights) ? item.highlights.filter(Boolean) : []
+    if (highlights.length) {
+      lines.push(`要点：${highlights.join('、')}`)
+    }
+  })
+  return lines.join('\n')
+}
+
+const explainImages = async (msg) => {
+  if (!msg?.id || !Array.isArray(msg?.results) || !msg.results.length) return
+  if (explainLoading.value[msg.id]) return
+  const ids = msg.results
+    .map((item) => Number(item?.id))
+    .filter((id) => Number.isFinite(id))
+    .slice(0, 6)
+  if (!ids.length) {
+    ElMessage.warning('没有可讲解的图片')
+    return
+  }
+  explainLoading.value[msg.id] = true
+  try {
+    const { data } = await api.post('/api/ai/explain-images', { imageIds: ids, style: 'friendly' })
+    if (data?.ok === false) {
+      const errMsg = data?.error || data?.detail || '讲解失败'
+      ElMessage.error(errMsg)
+      return
+    }
+    const text = buildExplainMessage(Array.isArray(data?.items) ? data.items : [])
+    appendMessage({ role: 'ai', type: 'text', content: text })
+    await scrollToBottom()
+  } catch (err) {
+    const errMsg = err?.response?.data?.error || err?.response?.data?.detail || '讲解失败'
+    ElMessage.error(errMsg)
+  } finally {
+    explainLoading.value[msg.id] = false
+  }
+}
+
 // 发送检索请求，使用 AI 兜底补充推荐标签
 const send = async (preset) => {
   const content = (preset ?? input.value).trim()
@@ -219,7 +274,7 @@ const send = async (preset) => {
   refreshTagSuggestions(content, latestResultsFromHistory())
 
   try {
-    const { data } = await api.post('/api/ai/chat-search', { message: content })
+    const { data } = await api.post('/api/ai/message', { message: content })
     if (currentReq !== requestId.value) {
       discardTyping()
       return
@@ -233,7 +288,11 @@ const send = async (preset) => {
       return
     }
 
-    const rawResults = Array.isArray(data?.results) ? data.results : []
+    const rawResults = Array.isArray(data?.images)
+      ? data.images
+      : Array.isArray(data?.results)
+        ? data.results
+        : []
     const results = rawResults.map(normalizeResult)
     const replyText = data?.reply || '我先为你整理了相关图片。'
     finalizeTyping({ type: results.length ? 'results' : 'text', content: replyText, results })
@@ -280,6 +339,13 @@ const removeSuggested = (res, tag) => {
   if (!Array.isArray(res.suggestedTags)) return
   const idx = res.suggestedTags.indexOf(tag)
   if (idx >= 0) res.suggestedTags.splice(idx, 1)
+}
+
+const normalizeRole = (role) => {
+  const raw = String(role || '').trim().toLowerCase()
+  if (['me', 'human', 'user'].includes(raw)) return 'user'
+  if (['assistant', 'ai'].includes(raw)) return 'ai'
+  return 'ai'
 }
 
 // 采纳 AI 推荐标签：写入后端并更新当前卡片的标签列表
@@ -356,7 +422,7 @@ watch(
           <span>对话区</span>
         </div>
         <div class="chat-actions">
-          <el-button text type="danger" :disabled="!messages.length" @click="clearMessages">????</el-button>
+          <el-button text type="danger" :disabled="!messages.length" @click="clearMessages">清空聊天记录</el-button>
           <el-tag type="warning" effect="plain">已接入 AI 检索与推荐标签</el-tag>
         </div>
       </div>
@@ -373,57 +439,71 @@ watch(
           </el-check-tag>
         </div>
       </div>
-      <div class="messages" ref="messagesEl">
-        <transition-group name="msg-fade" tag="div">
+      <el-scrollbar class="messages" ref="messagesEl">
+        <transition-group name="msg-fade" tag="div" class="message-list">
           <div
             v-for="(msg, idx) in messages"
             :key="msg.id || idx"
             class="bubble-row"
-            :class="msg.role"
+            :class="normalizeRole(msg.role)"
           >
-            <div class="avatar" :class="msg.role">{{ msg.role === 'ai' ? 'AI' : 'Me' }}</div>
-            <div class="bubble">
-              <div class="bubble-header">
-                <div class="bubble-meta">
-                  <span v-if="msg.role === 'ai'" class="label">AI</span>
-                  <span v-else class="label user">Me</span>
-                  <span v-if="msg.timestamp" class="time">{{ formatTime(msg.timestamp) }}</span>
+            <div class="avatar" :class="normalizeRole(msg.role)">{{ normalizeRole(msg.role) === 'ai' ? 'AI' : 'Me' }}</div>
+            <div class="bubble-col" :class="normalizeRole(msg.role)">
+              <div class="bubble" :class="normalizeRole(msg.role)">
+                <div class="bubble-header">
+                  <div class="bubble-meta">
+                    <span v-if="normalizeRole(msg.role) === 'ai'" class="label">AI</span>
+                    <span v-else class="label user">Me</span>
+                    <span v-if="msg.timestamp" class="time">{{ formatTime(msg.timestamp) }}</span>
+                  </div>
+                  <el-button
+                    v-if="msg.type !== 'typing'"
+                    class="delete-btn"
+                    text
+                    :icon="Delete"
+                    @click.stop="removeMessage(msg)"
+                  />
                 </div>
-                <el-button
-                  v-if="msg.type !== 'typing'"
-                  class="delete-btn"
-                  text
-                  :icon="Delete"
-                  @click.stop="removeMessage(msg)"
-                />
-              </div>
-              <p v-if="msg.type === 'text' && msg.content">{{ msg.content }}</p>
-              <div v-else-if="msg.type === 'typing'" class="typing-dots">
-                <span></span><span></span><span></span>
-              </div>
-              <div v-else-if="msg.type === 'results'" class="result-block">
-                <p v-if="msg.content" class="result-text">{{ msg.content }}</p>
-                <div v-if="msg.results?.length" class="result-grid">
-                  <div
-                    v-for="item in msg.results"
-                    :key="item.id || item.detailUrl"
-                    class="result-thumb"
-                    @click="openDetail(item)"
-                  >
-                    <el-image
-                      v-if="item.thumbUrl"
-                      :src="item.thumbUrl"
-                      fit="cover"
-                      class="thumb-img"
-                    />
+                <p v-if="msg.type === 'text' && msg.content" class="bubble-text">{{ msg.content }}</p>
+                <div v-else-if="msg.type === 'typing'" class="typing-dots">
+                  <span></span><span></span><span></span>
+                </div>
+                <div v-else-if="msg.type === 'results'" class="result-block">
+                  <p v-if="msg.content" class="result-text">{{ msg.content }}</p>
+                  <div v-if="msg.results?.length" class="result-grid">
+                    <div
+                      v-for="item in msg.results"
+                      :key="item.id || item.detailUrl"
+                      class="result-thumb"
+                      @click="openDetail(item)"
+                    >
+                      <el-image
+                        v-if="item.thumbUrl"
+                        :src="item.thumbUrl"
+                        fit="cover"
+                        class="thumb-img"
+                      />
                     <span v-else class="thumb-placeholder">No Image</span>
                   </div>
                 </div>
+                <el-button
+                  v-if="msg.results?.length"
+                  class="explain-btn"
+                  size="small"
+                  type="primary"
+                  plain
+                  :loading="explainLoading[msg.id]"
+                  :disabled="explainLoading[msg.id]"
+                  @click="explainImages(msg)"
+                >
+                  AI 讲解这些图片
+                </el-button>
               </div>
             </div>
           </div>
+          </div>
         </transition-group>
-      </div>
+      </el-scrollbar>
       <div class="composer">
         <el-input
           v-model="input"
@@ -560,15 +640,24 @@ watch(
 }
 
 .messages {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
   min-height: 260px;
-  padding: 8px;
   background: #f0f5ff;
   border-radius: 12px;
   border: 1px dashed var(--border);
-  overflow-y: auto;
+}
+
+.messages :deep(.el-scrollbar__view) {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px;
+}
+
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
 }
 
 .msg-fade-enter-active,
@@ -585,16 +674,32 @@ watch(
   display: flex;
   align-items: flex-start;
   gap: 10px;
+  width: 100%;
+}
+
+.bubble-col {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.bubble-col.user {
+  align-items: flex-end;
+}
+
+.bubble-col.ai {
+  align-items: flex-start;
 }
 
 .bubble-row.user {
-  justify-content: flex-start;
-  flex-direction: row;
+  justify-content: flex-end;
+  flex-direction: row-reverse;
 }
 
 .bubble-row.ai {
-  justify-content: flex-end;
-  flex-direction: row-reverse;
+  justify-content: flex-start;
+  flex-direction: row;
 }
 
 .avatar {
@@ -617,13 +722,23 @@ watch(
 }
 
 .bubble {
-  max-width: 86%;
+  max-width: 70%;
   background: #fff;
   border-radius: 14px;
   padding: 10px 12px;
   border: 1px solid var(--border);
   box-shadow: 0 8px 18px rgba(75, 140, 255, 0.08);
   position: relative;
+}
+
+.bubble.user {
+  border-top-right-radius: 6px;
+  border-bottom-right-radius: 6px;
+}
+
+.bubble.ai {
+  border-top-left-radius: 6px;
+  border-bottom-left-radius: 6px;
 }
 
 .bubble-row.user .bubble {
@@ -660,6 +775,10 @@ watch(
 .bubble p {
   margin: 6px 0 8px;
   color: var(--text);
+}
+
+.bubble-text {
+  white-space: pre-line;
 }
 
 .typing-dots {
@@ -721,6 +840,10 @@ watch(
   margin: 4px 0 8px;
   color: var(--text);
   line-height: 1.6;
+}
+
+.explain-btn {
+  margin-top: 8px;
 }
 
 .result-thumb {

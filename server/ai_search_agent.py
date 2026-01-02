@@ -52,6 +52,7 @@ _POLITE_PREFIXES = [
 _TRAILING_PARTICLES_RE = re.compile(r"[吗嘛呢吧呀啊哦哇啦喽呗～~。！？!,，、\\s]+$")
 _KEYWORD_SPLIT_RE = re.compile(r"[\\s,，。；;、/]+")
 _QUOTE_RE = re.compile(r"[\"“”‘’']([^\"“”‘’']+)[\"“”‘’']")
+_DISPLAY_TRIM_RE = re.compile(r"(有关|相关|关于|图片|照片|图)+$")
 _DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes", "on", "debug")
 
 # 尝试加载自定义词典
@@ -81,6 +82,10 @@ _STOPWORDS = {
     "照片",
     "图",
     "的",
+    "与",
+    "关于",
+    "有关",
+    "相关的",
     "下",
     "呢",
     "吗",
@@ -172,6 +177,20 @@ def filter_tokens(tokens: List[str]) -> List[str]:
         seen.add(t)
         filtered.append(t)
     return filtered[:10]
+
+
+def pick_display_keyword(query_obj: Dict[str, Any]) -> str:
+    """Return a concise keyword for UI replies, avoiding full-sentence echoes."""
+    keywords = [k for k in (query_obj.get("keywords") or []) if k]
+    if keywords:
+        return "、".join(keywords[:3])
+    cleaned = (query_obj.get("cleaned_keyword") or "").strip()
+    if cleaned:
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = _DISPLAY_TRIM_RE.sub("", cleaned).strip(" 的")
+        if cleaned:
+            return cleaned
+    return (query_obj.get("keyword") or "").strip()
 
 
 def _expand_keywords_with_synonyms(keywords: List[str], cleaned_keyword: str = "") -> List[str]:

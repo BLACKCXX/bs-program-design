@@ -3,15 +3,26 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 import zipfile  # #advise 批量打包下载
 import tempfile
+from typing import Dict, List, Optional, Tuple
 
 from flask import Blueprint, current_app, g, jsonify, request, send_file, send_from_directory
 from flask_jwt_extended import get_jwt_identity, jwt_required
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps  # 简单图像处理
+try:
+    import jieba
+    _JIEBA_AVAILABLE = True
+except Exception:
+    jieba = None
+    _JIEBA_AVAILABLE = False
 
 from server.db import execute, executemany, query
 from server.photo_analysis_agent import analyze_image
@@ -49,6 +60,34 @@ def _facet_from_sql(field_expr: str, owner_id: int, limit: int = 50):
     """
     rows = query(sql, (owner_id, limit))
     return [{"value": r["value"], "count": r["cnt"]} for r in rows]
+
+
+def _segment_query_tokens(query: str) -> Tuple[List[str], List[str]]:
+    """Split Chinese query into tokens; single-char tokens are treated as weak."""
+    raw = re.sub(r"\s+", " ", (query or "").strip())
+    if not raw:
+        return [], []
+    if _JIEBA_AVAILABLE:
+        parts = list(jieba.cut(raw, cut_all=False))
+    else:
+        parts = re.split(r"[\s,，]+", raw)
+    tokens = []
+    for part in parts:
+        token = (part or "").strip()
+        if not token:
+            continue
+        if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", token):
+            continue
+        tokens.append(token)
+    strong, weak = [], []
+    for token in tokens:
+        if len(token) <= 1:
+            weak.append(token)
+        else:
+            strong.append(token)
+    strong = list(dict.fromkeys(strong))
+    weak = list(dict.fromkeys(weak))
+    return strong, weak
 
 # ===== 简易鉴权（沿用当前 JWT 配置）=====
 '''
@@ -112,11 +151,225 @@ def _has_visibility_column() -> bool:
     return _VISIBILITY_COLUMN
 
 
+# ===== 图片编辑会话（Session + 历史栈）=====
+
+DEFAULT_UPLOAD_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), os.getenv("UPLOAD_DIR", "uploads"))
+)
+EDIT_SESSIONS: Dict[str, "EditSession"] = {}
+EDIT_SESSIONS_LOCK = threading.Lock()
+EDIT_SESSIONS_BOOTSTRAPPED = False
+
+
+@dataclass
+class EditSession:
+    session_id: str
+    owner_id: int
+    image_id: int
+    orig_abs_path: str
+    orig_rel_path: str
+    ext: str
+    versions: List[str]
+    idx: int
+    created_at: datetime
+    updated_at: datetime
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def to_dict(self) -> Dict:
+        return {
+            "session_id": self.session_id,
+            "owner_id": self.owner_id,
+            "image_id": self.image_id,
+            "orig_rel_path": self.orig_rel_path,
+            "ext": self.ext,
+            "versions": self.versions,
+            "idx": self.idx,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+def _get_upload_root() -> str:
+    try:
+        return os.path.abspath(current_app.config["UPLOAD_DIR"])
+    except Exception:
+        return DEFAULT_UPLOAD_DIR
+
+
+def _get_edit_sessions_root() -> str:
+    root = os.path.join(_get_upload_root(), "edit_sessions")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _session_rel_path(session_id: str, filename: str) -> str:
+    rel = os.path.join("edit_sessions", session_id, filename)
+    return rel.replace("\\", "/")
+
+
+def _session_abs_path(rel_path: str, upload_root: Optional[str] = None) -> str:
+    root = upload_root or _get_upload_root()
+    return os.path.join(root, rel_path)
+
+
+def _persist_session(session: EditSession, upload_root: Optional[str] = None) -> None:
+    root = upload_root or _get_upload_root()
+    session_dir = os.path.join(root, "edit_sessions", session.session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    meta_path = os.path.join(session_dir, "session.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
+
+
+def _parse_dt(raw: str) -> datetime:
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return datetime.utcnow()
+
+
+def _load_sessions_from_disk(upload_root: Optional[str] = None) -> None:
+    root = os.path.join(upload_root or DEFAULT_UPLOAD_DIR, "edit_sessions")
+    if not os.path.isdir(root):
+        return
+    for name in os.listdir(root):
+        session_dir = os.path.join(root, name)
+        if not os.path.isdir(session_dir):
+            continue
+        meta_path = os.path.join(session_dir, "session.json")
+        if not os.path.exists(meta_path):
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+        session_id = meta.get("session_id") or name
+        owner_id = int(meta.get("owner_id") or 0)
+        image_id = int(meta.get("image_id") or 0)
+        orig_rel = (meta.get("orig_rel_path") or "").strip()
+        ext = (meta.get("ext") or "").strip().lower()
+        versions = meta.get("versions") or []
+        idx = int(meta.get("idx") or 0)
+        if not session_id or not owner_id or not image_id or not orig_rel or not versions:
+            continue
+        if idx < 0 or idx >= len(versions):
+            idx = max(0, min(len(versions) - 1, idx))
+        created_at = _parse_dt(meta.get("created_at") or "")
+        updated_at = _parse_dt(meta.get("updated_at") or "")
+        upload_root = upload_root or DEFAULT_UPLOAD_DIR
+        orig_abs = os.path.join(upload_root, orig_rel)
+        session = EditSession(
+            session_id=session_id,
+            owner_id=owner_id,
+            image_id=image_id,
+            orig_abs_path=orig_abs,
+            orig_rel_path=orig_rel,
+            ext=ext,
+            versions=versions,
+            idx=idx,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+        EDIT_SESSIONS[session_id] = session
+
+
+def cleanup_old_sessions(ttl_minutes: int = 60, upload_root: Optional[str] = None) -> None:
+    root = upload_root or _get_upload_root()
+    sessions_root = os.path.join(root, "edit_sessions")
+    if not os.path.isdir(sessions_root):
+        return
+    now = datetime.utcnow()
+    ttl_seconds = max(1, ttl_minutes) * 60
+    expired_ids = []
+    with EDIT_SESSIONS_LOCK:
+        for sid, sess in EDIT_SESSIONS.items():
+            if (now - sess.updated_at).total_seconds() > ttl_seconds:
+                expired_ids.append(sid)
+    for sid in expired_ids:
+        _discard_session(sid, root)
+    # 清理未注册在内存中的残留目录
+    for name in os.listdir(sessions_root):
+        dir_path = os.path.join(sessions_root, name)
+        if not os.path.isdir(dir_path):
+            continue
+        if name in EDIT_SESSIONS:
+            continue
+        try:
+            mtime = os.path.getmtime(dir_path)
+        except Exception:
+            continue
+        if (now - datetime.utcfromtimestamp(mtime)).total_seconds() > ttl_seconds:
+            shutil.rmtree(dir_path, ignore_errors=True)
+
+
+def _bootstrap_edit_sessions() -> None:
+    global EDIT_SESSIONS_BOOTSTRAPPED
+    if EDIT_SESSIONS_BOOTSTRAPPED:
+        return
+    with EDIT_SESSIONS_LOCK:
+        if EDIT_SESSIONS_BOOTSTRAPPED:
+            return
+        upload_root = _get_upload_root()
+        os.makedirs(os.path.join(upload_root, "edit_sessions"), exist_ok=True)
+        _load_sessions_from_disk(upload_root)
+        cleanup_old_sessions(upload_root=upload_root)
+        EDIT_SESSIONS_BOOTSTRAPPED = True
+
+
+def _get_session(session_id: str, owner_id: int) -> Optional[EditSession]:
+    _bootstrap_edit_sessions()
+    session = EDIT_SESSIONS.get(session_id)
+    if not session or session.owner_id != owner_id:
+        return None
+    return session
+
+
+def _session_payload(session: EditSession) -> Dict:
+    current_rel = session.versions[session.idx] if session.versions else ""
+    return {
+        "session_id": session.session_id,
+        "status": "ready",
+        "current_url": f"/files/{current_rel}" if current_rel else "",
+        "idx": session.idx,
+        "len": len(session.versions),
+        "can_undo": session.idx > 0,
+        "can_redo": session.idx < len(session.versions) - 1,
+    }
+
+
+def _discard_session(session_id: str, upload_root: Optional[str] = None) -> None:
+    root = upload_root or _get_upload_root()
+    session = None
+    with EDIT_SESSIONS_LOCK:
+        session = EDIT_SESSIONS.pop(session_id, None)
+    if not session:
+        return
+    with session.lock:
+        pass
+    dir_path = os.path.join(root, "edit_sessions", session_id)
+    shutil.rmtree(dir_path, ignore_errors=True)
+
+
+# 模块加载时做一次过期清理，避免重启后残留堆积
+try:
+    cleanup_old_sessions(upload_root=DEFAULT_UPLOAD_DIR)
+except Exception:
+    pass
+
+
 # ===== 静态文件回显（/files/<path>）=====
 @bp.get("/files/<path:subpath>")
 def serve_file(subpath):
     root = os.path.abspath(current_app.config["UPLOAD_DIR"])
     return send_from_directory(root, subpath)
+
+
+def _absolute_url(path: str) -> str:
+    """Build absolute URL for clients that cannot resolve /files via proxy."""
+    if not path:
+        return ""
+    return f"{request.host_url.rstrip('/')}{path}"
 
 
 @bp.get("/api/images/facets")
@@ -542,21 +795,51 @@ def search_images():
 
     conditions = ["i.owner_id=%s"]
     params = [g.user_id]
+    score_expr = "0"
+    score_params: List = []
     joins = ["LEFT JOIN exif e ON e.image_id = i.id"]
     having = ""
     group_by = ""
 
-    # 名称 / 描述模糊
+    # 名称 / 描述模糊：短语优先，其次分词，单字仅在无更好词时参与
     if q:
-        like = f"%{q}%"
-        conditions.append(
-            "(i.title LIKE %s OR i.description LIKE %s OR EXISTS ("
-            "SELECT 1 FROM image_tags itq "
-            "JOIN tags tq ON tq.id = itq.tag_id "
-            "WHERE itq.image_id = i.id AND tq.owner_id=%s AND tq.name LIKE %s"
-            "))"
-        )
-        params.extend([like, like, g.user_id, like])
+        phrase = q.strip()
+        strong_tokens, weak_tokens = _segment_query_tokens(phrase)
+        token_terms = strong_tokens if strong_tokens else weak_tokens
+        q_terms = []
+        q_params: List = []
+        score_parts = []
+
+        def _text_match_sql() -> str:
+            return (
+                "(i.title LIKE %s OR i.description LIKE %s OR EXISTS ("
+                "SELECT 1 FROM image_tags itq "
+                "JOIN tags tq ON tq.id = itq.tag_id "
+                "WHERE itq.image_id = i.id AND tq.owner_id=%s AND tq.name LIKE %s"
+                "))"
+            )
+
+        def _add_term(term_value: str, weight: int):
+            term_sql = _text_match_sql()
+            like = f"%{term_value}%"
+            term_params = [like, like, g.user_id, like]
+            q_terms.append(term_sql)
+            q_params.extend(term_params)
+            score_parts.append(f"CASE WHEN {term_sql} THEN {weight} ELSE 0 END")
+            score_params.extend(term_params)
+
+        if phrase:
+            _add_term(phrase, 10)
+        for token in token_terms:
+            if not token or token == phrase:
+                continue
+            weight = 4 if len(token) > 1 else 1
+            _add_term(token, weight)
+
+        if q_terms:
+            conditions.append("(" + " OR ".join(q_terms) + ")")
+            params.extend(q_params)
+            score_expr = " + ".join(score_parts) if score_parts else "0"
 
     # 时间范围（取拍摄时间/创建时间）
     ts_expr = "COALESCE(i.taken_at, i.created_at)"
@@ -645,18 +928,19 @@ def search_images():
           i.taken_at, i.created_at,
           COALESCE(e.camera_make, i.camera_make) AS camera_make,
           COALESCE(e.camera_model, i.camera_model) AS camera_model,
-          e.iso, e.focal_length
+          e.iso, e.focal_length,
+          {score_expr} AS score
         FROM images i
         {" ".join(joins)}
         WHERE {where_sql}
         {group_by}
         {having}
-        ORDER BY sort_time DESC
+        ORDER BY score DESC, sort_time DESC
         LIMIT %s OFFSET %s
     """
     params.extend([limit, offset])
 
-    rows = query(sql, params)
+    rows = query(sql, score_params + params)
     if not rows:
         return jsonify({"items": []})
 
@@ -952,6 +1236,7 @@ def image_detail(image_id: int):
 
     rel_path = (img.get("stored_path") or img.get("path") or "").strip()
     url = f"/files/{rel_path}" if rel_path else ""
+    abs_url = _absolute_url(url)
 
     exif = {
         "camera": img.get("camera_model") or img.get("camera_make"),
@@ -992,6 +1277,8 @@ def image_detail(image_id: int):
         "description": img.get("description"),
         "visibility": img.get("visibility") if _has_visibility_column() else None,
         "url": url,
+        "absolute_url": abs_url,
+        "absoluteUrl": abs_url,
         "width": img.get("width"),
         "height": img.get("height"),
         "sizeMB": round((img.get("size_bytes") or 0) / 1024 / 1024, 1) if img.get("size_bytes") is not None else None,
@@ -1121,33 +1408,33 @@ def image_ai_tags(image_id: int):
 
 
 # 简易图像处理：裁剪、旋转、亮度/对比度/饱和度/色温/锐化/缩放
-def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
-    def _to_float(val):
-        try:
-            return float(val)
-        except Exception:
-            return None
+def _to_float(val):
+    try:
+        return float(val)
+    except Exception:
+        return None
 
-    def _to_int(val):
-        try:
-            return int(val)
-        except Exception:
-            return None
 
-    def _to_bool(val) -> bool:
-        if isinstance(val, bool):
-            return val
-        if isinstance(val, (int, float)):
-            return bool(val)
-        if isinstance(val, str):
-            return val.strip().lower() in ("1", "true", "yes", "y", "on")
-        return False
+def _to_int(val):
+    try:
+        return int(val)
+    except Exception:
+        return None
 
-    # 缩放使用 LANCZOS 重采样，保证像素级缩放质量
-    resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
 
-    # 1) 旋转（像素级旋转，使用工作台底色避免黑边）
-    deg_f = _to_float(params.get("rotate")) or 0
+def _to_bool(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
+
+
+def apply_rotate(img: Image.Image, params: dict) -> Image.Image:
+    deg_f = _to_float(params.get("deg")) if "deg" in params else _to_float(params.get("rotate"))
+    deg_f = deg_f or 0
     if deg_f % 360 != 0:
         fill_rgb = (245, 247, 250)
         try:
@@ -1157,26 +1444,38 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
             background = Image.new("RGBA", rotated.size, fill_rgb + (255,))
             background.paste(rotated, (0, 0), rotated)
             img = background.convert("RGB")
+    return img
 
-    # 2) 裁剪（基于旋转后的像素）
-    crop_rect = params.get("crop_rect")
-    if crop_rect and all(k in crop_rect for k in ("x", "y", "width", "height")):
-        try:
-            x = float(crop_rect["x"])
-            y = float(crop_rect["y"])
-            w = float(crop_rect["width"])
-            h = float(crop_rect["height"])
-            if w > 0 and h > 0:
-                x2 = min(img.width, x + w)
-                y2 = min(img.height, y + h)
-                x = max(0, x)
-                y = max(0, y)
-                if x2 > x and y2 > y:
-                    img = img.crop((x, y, x2, y2))
-        except Exception:
-            pass  # 裁剪异常时忽略
 
-    # 3) 亮度/对比度/饱和度/色温/锐化
+def apply_crop(img: Image.Image, params: dict) -> Image.Image:
+    crop_rect = params.get("crop_rect") or params.get("cropRect") or {}
+    if not isinstance(crop_rect, dict):
+        return img
+    if not any(k in crop_rect for k in ("x", "y", "w", "h", "width", "height")):
+        return img
+    try:
+        x = _to_float(crop_rect.get("x")) or 0
+        y = _to_float(crop_rect.get("y")) or 0
+        w = _to_float(crop_rect.get("w"))
+        h = _to_float(crop_rect.get("h"))
+        if w is None:
+            w = _to_float(crop_rect.get("width"))
+        if h is None:
+            h = _to_float(crop_rect.get("height"))
+        if not w or not h:
+            return img
+        x2 = min(img.width, x + w)
+        y2 = min(img.height, y + h)
+        x = max(0, x)
+        y = max(0, y)
+        if x2 > x and y2 > y:
+            img = img.crop((x, y, x2, y2))
+    except Exception:
+        pass  # 裁剪异常时忽略
+    return img
+
+
+def apply_adjust(img: Image.Image, params: dict) -> Image.Image:
     def _factor(val):
         try:
             return 1 + float(val) / 100
@@ -1193,7 +1492,10 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
     if s != 1:
         img = ImageEnhance.Color(img).enhance(s)
 
-    warm_v = _to_float(params.get("warmth")) or 0
+    warm_v = _to_float(params.get("temperature"))
+    if warm_v is None:
+        warm_v = _to_float(params.get("warmth"))
+    warm_v = warm_v or 0
     if warm_v != 0 and img.mode == "RGB":
         warm_v = max(-100.0, min(100.0, warm_v))
         strength = abs(warm_v) / 100.0
@@ -1206,68 +1508,481 @@ def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
         b_ = b_.point(lambda v: max(0, min(255, int(v * b_gain))))
         img = Image.merge("RGB", (r, g_, b_))
 
-    sharp_v = _to_float(params.get("sharpen")) or 0
+    sharp_v = _to_float(params.get("sharpness"))
+    if sharp_v is None:
+        sharp_v = _to_float(params.get("sharpen"))
+    sharp_v = sharp_v or 0
     if sharp_v > 0:
         sharp_v = max(0.0, min(100.0, sharp_v))
         scale = sharp_v / 100.0
         radius = 1.2 + scale * 1.3
         percent = int(100 + scale * 300)
         img = img.filter(ImageFilter.UnsharpMask(radius=radius, percent=percent, threshold=3))
+    return img
 
-    # 4) 缩放：等比缩放 + 必要时 padding，避免裁切内容
-    tw = _to_int(params.get("target_width"))
-    th = _to_int(params.get("target_height"))
-    keep_ratio = _to_bool(params.get("keep_ratio"))
-    resize_mode = (params.get("resize_mode") or "").strip().lower()
-    ratio_w = _to_float(params.get("ratio_width"))
-    ratio_h = _to_float(params.get("ratio_height"))
+
+def apply_scale(img: Image.Image, params: dict) -> Image.Image:
+    # 缩放使用 LANCZOS 重采样，保证像素级缩放质量
+    resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    factor = _to_float(params.get("factor") or params.get("scale"))
+    tw = _to_int(params.get("target_width") or params.get("width"))
+    th = _to_int(params.get("target_height") or params.get("height"))
+    keep_ratio = _to_bool(params.get("keep_ratio") or params.get("keepRatio"))
+    resize_mode = (params.get("resize_mode") or params.get("resizeMode") or "").strip().lower()
+    ratio_w = _to_float(params.get("ratio_width") or params.get("ratioWidth"))
+    ratio_h = _to_float(params.get("ratio_height") or params.get("ratioHeight"))
+
+    if (tw is None and th is None) and factor:
+        factor = max(0.05, min(8.0, factor))
+        tw = int(round(img.width * factor))
+        th = int(round(img.height * factor))
+
     if tw is not None and tw <= 0:
         tw = None
     if th is not None and th <= 0:
         th = None
 
-    if tw or th:
-        orig_w, orig_h = img.size
-        if keep_ratio:
-            if ratio_w and ratio_h and ratio_h != 0:
-                if tw and not th:
-                    th = int(round(tw * (ratio_h / ratio_w)))
-                elif th and not tw:
-                    tw = int(round(th * (ratio_w / ratio_h)))
-                elif tw and th:
-                    th = int(round(tw * (ratio_h / ratio_w)))
-                else:
-                    tw = orig_w
-                    th = int(round(orig_w * (ratio_h / ratio_w)))
+    if not (tw or th):
+        return img
+
+    orig_w, orig_h = img.size
+    if keep_ratio:
+        if ratio_w and ratio_h and ratio_h != 0:
+            if tw and not th:
+                th = int(round(tw * (ratio_h / ratio_w)))
+            elif th and not tw:
+                tw = int(round(th * (ratio_w / ratio_h)))
+            elif tw and th:
+                th = int(round(tw * (ratio_h / ratio_w)))
             else:
-                if tw and not th:
-                    th = int(round(tw * (orig_h / orig_w)))
-                elif th and not tw:
-                    tw = int(round(th * (orig_w / orig_h)))
+                tw = orig_w
+                th = int(round(orig_w * (ratio_h / ratio_w)))
         else:
             if tw and not th:
-                th = orig_h
+                th = int(round(tw * (orig_h / orig_w)))
             elif th and not tw:
-                tw = orig_w
+                tw = int(round(th * (orig_w / orig_h)))
+    else:
+        if tw and not th:
+            th = orig_h
+        elif th and not tw:
+            tw = orig_w
 
-        tw = max(1, int(tw)) if tw else None
-        th = max(1, int(th)) if th else None
-        if tw and th:
-            try:
-                if not resize_mode:
-                    resize_mode = "pad" if keep_ratio else "stretch"
-                if resize_mode in ("fit", "contain"):
-                    resize_mode = "pad" if keep_ratio else "stretch"
-                if resize_mode not in ("stretch", "pad"):
-                    resize_mode = "pad" if keep_ratio else "stretch"
-                if resize_mode == "pad":
-                    img = ImageOps.pad(img, (tw, th), method=resample, color="white")
-                else:
-                    img = img.resize((tw, th), resample=resample)
-            except Exception:
-                pass  # 缩放异常时保持原图
-
+    tw = max(1, int(tw)) if tw else None
+    th = max(1, int(th)) if th else None
+    if not (tw and th):
+        return img
+    try:
+        if not resize_mode:
+            resize_mode = "pad" if keep_ratio else "stretch"
+        if resize_mode in ("fit", "contain"):
+            resize_mode = "pad" if keep_ratio else "stretch"
+        if resize_mode not in ("stretch", "pad"):
+            resize_mode = "pad" if keep_ratio else "stretch"
+        if resize_mode == "pad":
+            img = ImageOps.pad(img, (tw, th), method=resample, color="white")
+        else:
+            img = img.resize((tw, th), resample=resample)
+    except Exception:
+        pass  # 缩放异常时保持原图
     return img
+
+
+def _apply_edits(img: Image.Image, params: dict) -> Image.Image:
+    img = apply_rotate(img, params)
+    img = apply_crop(img, params)
+    img = apply_adjust(img, params)
+    img = apply_scale(img, params)
+    return img
+
+
+def _flatten_for_save(img: Image.Image) -> Image.Image:
+    if img.mode in ("RGBA", "LA"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        return bg
+    if img.mode != "RGB":
+        return img.convert("RGB")
+    return img
+
+
+def _safe_abs_path(rel_path: str, upload_root: str) -> Optional[str]:
+    if not rel_path:
+        return None
+    base_root = os.path.abspath(upload_root)
+    abs_path = os.path.abspath(os.path.join(upload_root, rel_path))
+    if os.path.commonpath([abs_path, base_root]) != base_root:
+        return None
+    return abs_path
+
+
+@bp.post("/api/images/<int:image_id>/edit/session")
+@jwt_required()
+def create_edit_session(image_id: int):
+    g.user_id = _current_user_id_from_jwt()
+    _bootstrap_edit_sessions()
+    cleanup_old_sessions()
+    row = query(
+        "SELECT id,owner_id,stored_path,path FROM images WHERE id=%s AND owner_id=%s LIMIT 1",
+        (image_id, g.user_id or 0),
+    )
+    if not row:
+        return jsonify({"error": "图片不存在或无权限查看"}), 404
+    base = row[0]
+    rel_path = (base.get("stored_path") or base.get("path") or "").strip()
+    if not rel_path:
+        return jsonify({"error": "原图路径缺失"}), 400
+
+    upload_root = _get_upload_root()
+    abs_in = _safe_abs_path(rel_path, upload_root)
+    if not abs_in or not os.path.exists(abs_in):
+        return jsonify({"error": "原图文件不存在"}), 404
+
+    session_id = uuid.uuid4().hex
+    session_dir = os.path.join(upload_root, "edit_sessions", session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    ext = (os.path.splitext(rel_path)[-1] or ".jpg").lower()
+    rel_copy = _session_rel_path(session_id, f"v000{ext}")
+    abs_copy = os.path.join(upload_root, rel_copy)
+    try:
+        try:
+            os.link(abs_in, abs_copy)
+        except Exception:
+            shutil.copy2(abs_in, abs_copy)
+    except Exception as exc:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        return jsonify({"error": f"创建编辑会话失败: {exc}"}), 500
+    now = datetime.utcnow()
+    session = EditSession(
+        session_id=session_id,
+        owner_id=g.user_id or 0,
+        image_id=image_id,
+        orig_abs_path=abs_in,
+        orig_rel_path=rel_path,
+        ext=ext,
+        versions=[rel_copy],
+        idx=0,
+        created_at=now,
+        updated_at=now,
+    )
+    with EDIT_SESSIONS_LOCK:
+        EDIT_SESSIONS[session_id] = session
+    _persist_session(session, upload_root)
+    return jsonify(_session_payload(session))
+
+
+@bp.get("/api/images/edit/session/<session_id>")
+@jwt_required()
+def get_edit_session(session_id: str):
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if not session:
+        return jsonify({"error": "会话不存在或无权限"}), 404
+    return jsonify(_session_payload(session))
+
+
+@bp.get("/api/images/<int:image_id>/edit/session/<session_id>/status")
+@jwt_required()
+def get_edit_session_status(image_id: int, session_id: str):
+    """轻量状态检查：仅用于确认会话是否就绪。"""
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if not session or session.image_id != image_id:
+        return jsonify({"error": "会话不存在或无权限"}), 404
+    return jsonify({"session_id": session.session_id, "status": "ready"})
+
+
+@bp.delete("/api/images/<int:image_id>/edit/session/<session_id>")
+@jwt_required()
+def discard_edit_session_by_image(image_id: int, session_id: str):
+    """兼容带 image_id 的删除入口，便于前端清理会话。"""
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if session and session.image_id == image_id:
+        _discard_session(session_id)
+    return jsonify({"ok": True})
+
+
+@bp.post("/api/images/edit/session/<session_id>/apply")
+@jwt_required()
+def apply_edit_session(session_id: str):
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if not session:
+        return jsonify({"error": "会话不存在或无权限"}), 404
+    data = request.get_json(silent=True) or {}
+    op = (data.get("op") or "").strip().lower()
+    params = data.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    if op not in ("crop", "scale", "rotate", "adjust"):
+        return jsonify({"error": "不支持的编辑操作"}), 400
+
+    upload_root = _get_upload_root()
+    with session.lock:
+        current_rel = session.versions[session.idx]
+        abs_in = _session_abs_path(current_rel, upload_root)
+        if not os.path.exists(abs_in):
+            return jsonify({"error": "会话文件不存在"}), 404
+        try:
+            with Image.open(abs_in) as img:
+                img = img.convert("RGB")
+                if op == "crop":
+                    img = apply_crop(img, params)
+                elif op == "scale":
+                    img = apply_scale(img, params)
+                elif op == "rotate":
+                    img = apply_rotate(img, params)
+                else:
+                    img = apply_adjust(img, params)
+        except Exception as exc:
+            return jsonify({"error": f"编辑失败: {exc}"}), 500
+
+        if session.idx < len(session.versions) - 1:
+            stale = session.versions[session.idx + 1 :]
+            for rel in stale:
+                abs_path = _session_abs_path(rel, upload_root)
+                if os.path.exists(abs_path):
+                    try:
+                        os.remove(abs_path)
+                    except Exception:
+                        pass
+            session.versions = session.versions[: session.idx + 1]
+
+        next_idx = session.idx + 1
+        filename = f"v{next_idx:03d}.png"
+        rel_out = _session_rel_path(session_id, filename)
+        abs_out = _session_abs_path(rel_out, upload_root)
+        try:
+            img.save(abs_out, format="PNG")
+        except Exception as exc:
+            return jsonify({"error": f"保存版本失败: {exc}"}), 500
+        session.versions.append(rel_out)
+        session.idx = next_idx
+        session.updated_at = datetime.utcnow()
+        _persist_session(session, upload_root)
+    return jsonify(_session_payload(session))
+
+
+@bp.post("/api/images/edit/session/<session_id>/undo")
+@jwt_required()
+def undo_edit_session(session_id: str):
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if not session:
+        return jsonify({"error": "会话不存在或无权限"}), 404
+    with session.lock:
+        if session.idx > 0:
+            session.idx -= 1
+            session.updated_at = datetime.utcnow()
+            _persist_session(session)
+    return jsonify(_session_payload(session))
+
+
+@bp.post("/api/images/edit/session/<session_id>/redo")
+@jwt_required()
+def redo_edit_session(session_id: str):
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if not session:
+        return jsonify({"error": "会话不存在或无权限"}), 404
+    with session.lock:
+        if session.idx < len(session.versions) - 1:
+            session.idx += 1
+            session.updated_at = datetime.utcnow()
+            _persist_session(session)
+    return jsonify(_session_payload(session))
+
+
+@bp.post("/api/images/edit/session/<session_id>/commit")
+@jwt_required()
+def commit_edit_session(session_id: str):
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if not session:
+        return jsonify({"error": "会话不存在或无权限"}), 404
+    base_rows = query(
+        "SELECT id,title FROM images WHERE id=%s AND owner_id=%s LIMIT 1",
+        (session.image_id, g.user_id or 0),
+    )
+    if not base_rows:
+        return jsonify({"error": "图片不存在或无权限查看"}), 404
+    base = base_rows[0]
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("mode") or "override").strip().lower()
+    export_name = (data.get("export_name") or data.get("exportName") or "").strip()
+    if mode not in ("override", "new"):
+        return jsonify({"error": "保存模式无效"}), 400
+    if mode == "new" and not export_name:
+        return jsonify({"error": "缺少导出名称"}), 400
+
+    upload_root = _get_upload_root()
+    with session.lock:
+        current_rel = session.versions[session.idx]
+        abs_in = _session_abs_path(current_rel, upload_root)
+        if not os.path.exists(abs_in):
+            return jsonify({"error": "会话文件不存在"}), 404
+        try:
+            with Image.open(abs_in) as img:
+                img = _flatten_for_save(img)
+                orig_ext = session.ext or (os.path.splitext(session.orig_rel_path)[-1] or ".jpg")
+                orig_ext = orig_ext.lower() if orig_ext.startswith(".") else f".{orig_ext}"
+                if mode == "new":
+                    name_ext = os.path.splitext(export_name)[-1].lower()
+                    ext = name_ext if name_ext else orig_ext
+                else:
+                    ext = orig_ext
+                if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+                    ext = ".jpg"
+                fmt = "JPEG" if ext in [".jpg", ".jpeg"] else ext.replace(".", "").upper() or "PNG"
+                buf = BytesIO()
+                if fmt == "JPEG":
+                    img.save(buf, format=fmt, quality=92)
+                else:
+                    img.save(buf, format=fmt)
+                binary = buf.getvalue()
+        except Exception as exc:
+            return jsonify({"error": f"保存失败: {exc}"}), 500
+
+        sha256 = hashlib.sha256(binary).hexdigest()
+        size_bytes = len(binary)
+
+        if mode == "override":
+            rel_out = session.orig_rel_path
+            abs_out = _safe_abs_path(rel_out, upload_root)
+            if not abs_out:
+                return jsonify({"error": "原图路径异常"}), 400
+        else:
+            subdir = f"{g.user_id}/{time.strftime('%Y%m')}"
+            os.makedirs(os.path.join(upload_root, subdir), exist_ok=True)
+            fname = f"{int(time.time()*1000)}_{hashlib.md5(binary).hexdigest()[:8]}{ext or '.png'}"
+            abs_out = os.path.join(upload_root, subdir, fname)
+            rel_out = f"{subdir}/{fname}"
+
+        with open(abs_out, "wb") as f:
+            f.write(binary)
+
+        meta = extract_exif(abs_out)
+        width = meta.get("width")
+        height = meta.get("height")
+        taken_at = meta.get("taken_at")
+
+        if mode == "override":
+            execute(
+                """
+                UPDATE images
+                SET stored_path=%s, path=%s, mime_type=%s,
+                    size_bytes=%s, width=%s, height=%s, sha256=%s,
+                    taken_at=%s, updated_at=NOW(), title=COALESCE(%s,title)
+                WHERE id=%s AND owner_id=%s
+                """,
+                (
+                    rel_out,
+                    rel_out,
+                    f"image/{fmt.lower()}",
+                    size_bytes,
+                    width,
+                    height,
+                    sha256,
+                    taken_at.strftime("%Y-%m-%d %H:%M:%S") if taken_at else None,
+                    export_name or None,
+                    session.image_id,
+                    g.user_id,
+                ),
+            )
+            target_id = session.image_id
+        else:
+            target_id = execute(
+                """
+                INSERT INTO images
+                (owner_id, parent_id, path, stored_path, mime_type, size_bytes, width, height, sha256,
+                 taken_at, title, description, created_at)
+                SELECT owner_id, id, %s, %s, %s, %s, %s, %s, %s,
+                       %s, %s, description, NOW()
+                FROM images WHERE id=%s AND owner_id=%s
+                """,
+                (
+                    rel_out,
+                    rel_out,
+                    f"image/{fmt.lower()}",
+                    size_bytes,
+                    width,
+                    height,
+                    sha256,
+                    taken_at.strftime("%Y-%m-%d %H:%M:%S") if taken_at else None,
+                    export_name or (base.get("title") or ""),
+                    session.image_id,
+                    g.user_id,
+                ),
+            )
+            tag_ids = query("SELECT tag_id FROM image_tags WHERE image_id=%s", (session.image_id,))
+            if tag_ids:
+                executemany(
+                    "INSERT IGNORE INTO image_tags (image_id,tag_id) VALUES (%s,%s)",
+                    [(target_id, t["tag_id"]) for t in tag_ids],
+                )
+
+        extra_json = None
+        if meta.get("extra") is not None:
+            try:
+                extra_json = json.dumps(meta["extra"], ensure_ascii=False)
+            except TypeError:
+                extra_json = json.dumps(str(meta["extra"]), ensure_ascii=False)
+        execute(
+            """
+            INSERT INTO exif
+              (image_id, camera_make, camera_model,
+               f_number, exposure_time, iso, focal_length,
+               taken_at, gps_lat, gps_lng, extra)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+              camera_make=VALUES(camera_make),
+              camera_model=VALUES(camera_model),
+              f_number=VALUES(f_number),
+              exposure_time=VALUES(exposure_time),
+              iso=VALUES(iso),
+              focal_length=VALUES(focal_length),
+              taken_at=VALUES(taken_at),
+              gps_lat=VALUES(gps_lat),
+              gps_lng=VALUES(gps_lng),
+              extra=VALUES(extra)
+            """,
+            (
+                target_id,
+                meta.get("camera_make"),
+                meta.get("camera_model"),
+                meta.get("f_number"),
+                meta.get("exposure_time"),
+                meta.get("iso"),
+                meta.get("focal_length"),
+                meta.get("taken_at"),
+                meta.get("gps_lat"),
+                meta.get("gps_lng"),
+                extra_json,
+            ),
+        )
+
+    _discard_session(session_id, upload_root)
+    resp = {"ok": True, "image_id": target_id, "path": rel_out, "url": f"/files/{rel_out}"}
+    stamp_row = query(
+        "SELECT updated_at, created_at FROM images WHERE id=%s AND owner_id=%s LIMIT 1",
+        (target_id, g.user_id or 0),
+    )
+    if stamp_row:
+        stamp = stamp_row[0].get("updated_at") or stamp_row[0].get("created_at")
+        if stamp:
+            resp["updatedAt"] = stamp.strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(resp)
+
+
+@bp.delete("/api/images/edit/session/<session_id>")
+@jwt_required()
+def discard_edit_session(session_id: str):
+    g.user_id = _current_user_id_from_jwt()
+    session = _get_session(session_id, g.user_id or 0)
+    if session:
+        _discard_session(session_id)
+    return jsonify({"ok": True})
 
 
 # 预览渲染接口：前端 POST /api/images/<id>/preview

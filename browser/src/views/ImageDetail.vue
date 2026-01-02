@@ -48,6 +48,7 @@ const imgLoading = ref(false)
 const showGps = ref(false)
 const newTag = ref('')
 const tagTypes = ['success', 'warning', 'info', 'danger']
+const PREVIEW_TIMEOUT = 30000
 
 const visibilityOptions = [
   { label: '公开', value: 'public' },
@@ -264,12 +265,18 @@ const toggleGps = () => {
 
 const normalizeFilePath = (p = '') => {
   if (!p) return ''
-  let clean = String(p).replace(/\\/g, '/').replace(/^\/+/, '')
+  const raw = String(p).trim()
+  if (/^https?:\/\//i.test(raw) || raw.startsWith('blob:') || raw.startsWith('data:') || raw.startsWith('//')) {
+    return raw
+  }
+  let clean = raw.replace(/\\/g, '/').replace(/^\/+/, '')
   clean = clean.replace(/^files\//, '')
   return `/files/${encodeURI(clean)}`
 }
 
 const pickUrl = (data = {}) =>
+  data.absolute_url ||
+  data.absoluteUrl ||
   data.url ||
   data.cover_url ||
   data.thumb_url ||
@@ -277,6 +284,9 @@ const pickUrl = (data = {}) =>
   data.path ||
   data.thumb ||
   ''
+
+const resolveError = (err, fallback = '请求失败') =>
+  err?.response?.data?.error || err?.response?.data?.detail || err?.message || fallback
 
 const stageRef = ref(null)
 const stageSize = ref({ w: 0, h: 0 })
@@ -334,13 +344,15 @@ const fetchPreviewBlob = async (url) => {
   try {
     imgLoading.value = true
     loadError.value = ''
-    const resp = await api.get(url, { responseType: 'blob' })
+    const resp = await api.get(url, { responseType: 'blob', timeout: PREVIEW_TIMEOUT })
     if (blobUrl.value) URL.revokeObjectURL(blobUrl.value)
     blobUrl.value = URL.createObjectURL(resp.data)
     previewSrc.value = blobUrl.value
   } catch (err) {
     console.error('[preview] blob fetch failed', url, err)
-    ElMessage.error('图片加载失败')
+    const msg = resolveError(err, '图片加载失败')
+    loadError.value = `[preview] ${msg}`
+    ElMessage.error(msg)
     imgLoading.value = false
   }
 }
@@ -376,58 +388,68 @@ const onPreviewLoad = async (e) => {
 
 // 加载图片详情，附带版本戳破缓存，填充关系与标签
 const loadDetail = async () => {
+  loading.value = true
+  loadError.value = ''
+  imgLoading.value = true
+  previewSrc.value = ''
+  imgNatural.value = { w: 0, h: 0 }
+  viewMode.value = 'fitScreen'
+  zoom.value = 100
+  isEditingMeta.value = false
+
+  let data = null
   try {
-    loading.value = true
-    loadError.value = ''
-    imgLoading.value = true
-    previewSrc.value = ''
-    imgNatural.value = { w: 0, h: 0 }
-    viewMode.value = 'fitScreen'
-    zoom.value = 100
-    isEditingMeta.value = false
-    const { data } = await api.get(`/api/images/${route.params.id}`)
-    const picked = pickUrl(data)
-    const stamp =
-      data.updated_at ||
-      data.updatedAt ||
-      data.updated ||
-      data.updatedAt ||
-      data.updated_at ||
-      data.updated_at ||
-      data.created_at ||
-      data.createdAt
-    const queryBust = Number(route.query.t)
-    const versionTag = Number.isFinite(queryBust) && queryBust > 0 ? queryBust : (stamp ? new Date(stamp).getTime() || Date.now() : Date.now())
-    const absUrl = picked ? `${normalizeFilePath(picked)}?v=${versionTag}` : ''
-    image.value = {
-      ...emptyImage,
-      ...data,
-      url: absUrl,
-      exif: data.exif || {},
-      relations: {
-        parent: data.relations?.parent
-          ? {
-              ...data.relations.parent,
-              thumb: data.relations.parent.thumb ? `${normalizeFilePath(data.relations.parent.thumb)}?v=${versionTag}` : '',
-            }
-          : null,
-        children: (data.relations?.children || []).map((c) => ({
-          ...c,
-          thumb: c.thumb ? `${normalizeFilePath(c.thumb)}?v=${versionTag}` : '',
-        })),
-      },
-      tags: data.tags || [],
-    }
-    suggestedTags.value = data.suggested_tags || data.suggestedTags || []
-    syncMetaForm(image.value)
-    previewSrc.value = absUrl
-    await nextTick()
-    updateStageSize()
+    const resp = await api.get(`/api/images/${route.params.id}`)
+    data = resp.data
   } catch (err) {
-    ElMessage.error(err?.response?.data?.error || '加载图片详情失败')
-    loadError.value = err?.response?.data?.error || err?.message || '加载失败'
+    const msg = resolveError(err, '加载图片详情失败')
+    loadError.value = `[detail] ${msg}`
+    ElMessage.error(msg)
     imgLoading.value = false
+    loading.value = false
+    return
   }
+
+  const picked = pickUrl(data)
+  const stamp =
+    data.updated_at ||
+    data.updatedAt ||
+    data.updated ||
+    data.updatedAt ||
+    data.updated_at ||
+    data.updated_at ||
+    data.created_at ||
+    data.createdAt
+  const queryBust = Number(route.query.t)
+  const versionTag =
+    Number.isFinite(queryBust) && queryBust > 0
+      ? queryBust
+      : (stamp ? new Date(stamp).getTime() || Date.now() : Date.now())
+  const absUrl = picked ? `${normalizeFilePath(picked)}?v=${versionTag}` : ''
+  image.value = {
+    ...emptyImage,
+    ...data,
+    url: absUrl,
+    exif: data.exif || {},
+    relations: {
+      parent: data.relations?.parent
+        ? {
+            ...data.relations.parent,
+            thumb: data.relations.parent.thumb ? `${normalizeFilePath(data.relations.parent.thumb)}?v=${versionTag}` : '',
+          }
+        : null,
+      children: (data.relations?.children || []).map((c) => ({
+        ...c,
+        thumb: c.thumb ? `${normalizeFilePath(c.thumb)}?v=${versionTag}` : '',
+      })),
+    },
+    tags: data.tags || [],
+  }
+  suggestedTags.value = data.suggested_tags || data.suggestedTags || []
+  syncMetaForm(image.value)
+  previewSrc.value = absUrl
+  await nextTick()
+  updateStageSize()
   loading.value = false
 }
 
@@ -540,11 +562,6 @@ const goEdit = () => {
         <el-tabs v-model="activeTab" class="side-tabs">
           <el-tab-pane label="基本信息" name="basic">
             <div class="block">
-              <div class="meta-actions">
-                <el-button type="primary" :disabled="isEditingMeta" @click="startEditMeta">修改信息</el-button>
-                <el-button type="danger" :loading="savingMeta" :disabled="!isEditingMeta" @click="saveMeta">保存修改</el-button>
-                <el-button v-if="isEditingMeta" :disabled="savingMeta" @click="cancelEditMeta">取消修改</el-button>
-              </div>
               <el-form label-width="68px" size="default" :model="metaForm">
                 <el-form-item label="标题">
                   <el-input v-model="metaForm.title" :disabled="!isEditingMeta" placeholder="输入标题" />
@@ -558,6 +575,11 @@ const goEdit = () => {
                   </el-select>
                 </el-form-item>
               </el-form>
+              <div class="meta-actions meta-actions-bottom">
+                <el-button type="primary" :disabled="isEditingMeta" @click="startEditMeta">修改信息</el-button>
+                <el-button type="danger" :loading="savingMeta" :disabled="!isEditingMeta" @click="saveMeta">保存修改</el-button>
+                <el-button v-if="isEditingMeta" :disabled="savingMeta" @click="cancelEditMeta">取消修改</el-button>
+              </div>
             </div>
 
             <div class="block">
@@ -880,7 +902,10 @@ const goEdit = () => {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin-bottom: 10px;
+  margin-bottom: 0;
+}
+.meta-actions-bottom {
+  margin-top: 10px;
 }
 .block-title {
   font-weight: 600;
