@@ -7,6 +7,12 @@ import api from '../api/http'
 import { toDisplayUrl } from '../utils/url'
 
 const toAbs = (p) => toDisplayUrl(p)
+const withVersion = (url, stamp) => {
+  if (!url) return ''
+  if (!stamp) return url
+  const joiner = url.includes('?') ? '&' : '?'
+  return `${url}${joiner}v=${encodeURIComponent(stamp)}`
+}
 
 const layoutMode = ref('grid')
 
@@ -100,7 +106,7 @@ const mapResult = (item) => ({
   tags: item.tags || [],
   date: item.date,
   size: item.sizeMB != null ? `${item.sizeMB} MB` : '',
-  cover: toAbs(item.url || ''),
+  cover: withVersion(toAbs(item.url || ''), item.updatedAt),
 })
 
 const loadSearchResults = async () => {
@@ -127,7 +133,7 @@ const loadSearchResults = async () => {
       params.min_size_mb = filters.minSizeMB
       params.max_size_mb = Math.min(filters.maxSizeMB, 10)
     }
-    if (filters.tags.length) params.tags = filters.tags
+    if (filters.tags.length) params.tags = filters.tags.join(',') // tag filter params
 
     const { data } = await api.get('/api/images/search', { params })
     results.value = (data.items || []).map(mapResult)

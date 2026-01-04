@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, onMounted, ref, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { MagicStick, ChatLineRound, Loading, Delete } from '@element-plus/icons-vue'
@@ -26,10 +26,13 @@ const input = ref('')
 const sending = ref(false)
 const typingMsg = ref(null)
 const messagesEl = ref(null)
+const autoScroll = ref(true) // auto-scroll guard
 const allTags = ref([])
 const loadingTags = ref(false)
 const requestId = ref(0)
 const explainLoading = ref({})
+let scrollWrap = null
+let scrollHandler = null
 
 const appendMessage = (payload, { persist = true } = {}) => {
   const msg = workspaceStore.pushMessage(payload)
@@ -128,17 +131,35 @@ const refreshTagSuggestions = (query = '', results = []) => {
   workspaceStore.persist()
 }
 
-const scrollToBottom = async () => {
+const getScrollWrap = () => {
+  const el = messagesEl.value
+  return el?.wrapRef || el?.$el?.querySelector('.el-scrollbar__wrap') || el
+}
+
+const isAtBottom = (wrap) => {
+  if (!wrap) return true
+  const threshold = 40
+  return wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight <= threshold
+}
+
+const updateAutoScroll = () => {
+  const wrap = getScrollWrap()
+  if (!wrap) return
+  autoScroll.value = isAtBottom(wrap)
+}
+
+const scrollToBottom = async (force = false) => {
   await nextTick()
+  if (!force && !autoScroll.value) return
   const el = messagesEl.value
   if (!el) return
-  const wrap = el.wrapRef || el.$el?.querySelector('.el-scrollbar__wrap') || el
+  const wrap = getScrollWrap()
   const max = wrap?.scrollHeight || 0
   if (typeof el.setScrollTop === 'function') {
     el.setScrollTop(max)
     return
   }
-  if ('scrollTop' in wrap) wrap.scrollTop = max
+  if (wrap && 'scrollTop' in wrap) wrap.scrollTop = max
 }
 
 const discardTyping = () => {
@@ -265,12 +286,12 @@ const send = async (preset) => {
   appendMessage({ role: 'user', type: 'text', content })
   workspaceStore.setLastQuery(content)
   workspaceStore.persist()
-  await scrollToBottom()
+  await scrollToBottom(true)
 
   input.value = ''
   sending.value = true
   typingMsg.value = appendMessage({ role: 'ai', type: 'typing', content: '' }, { persist: false })
-  await scrollToBottom()
+  await scrollToBottom(true)
   refreshTagSuggestions(content, latestResultsFromHistory())
 
   try {
@@ -369,13 +390,27 @@ const rejectTag = (res, tag) => {
 
 onMounted(async () => {
   await nextTick()
-  await scrollToBottom()
+  scrollWrap = getScrollWrap()
+  if (scrollWrap) {
+    scrollHandler = () => updateAutoScroll()
+    scrollWrap.addEventListener('scroll', scrollHandler, { passive: true })
+    updateAutoScroll()
+  }
+  await scrollToBottom(true)
   await loadAllTags()
   if (lastQuery.value) {
     refreshTagSuggestions(lastQuery.value, latestResultsFromHistory())
   } else {
     refreshTagSuggestions('', latestResultsFromHistory())
   }
+})
+
+onUnmounted(() => {
+  if (scrollWrap && scrollHandler) {
+    scrollWrap.removeEventListener('scroll', scrollHandler)
+  }
+  scrollWrap = null
+  scrollHandler = null
 })
 
 watch(
@@ -538,6 +573,7 @@ watch(
   display: flex;
   flex-direction: column;
   gap: 16px;
+  min-height: 100vh;
 }
 
 .header {
@@ -585,6 +621,8 @@ watch(
   display: flex;
   flex-direction: column;
   gap: 12px;
+  flex: 1;
+  min-height: 0;
 }
 
 .chat-head {
@@ -644,6 +682,14 @@ watch(
   background: #f0f5ff;
   border-radius: 12px;
   border: 1px dashed var(--border);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.messages :deep(.el-scrollbar__wrap) {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .messages :deep(.el-scrollbar__view) {
@@ -896,6 +942,9 @@ watch(
 @media (max-width: 768px) {
   .ai-page {
     gap: 12px;
+    height: auto;
+    min-height: 100dvh;
+    overflow-y: auto; /* mobile responsive */
   }
 
   .header {
@@ -926,8 +975,16 @@ watch(
   }
 
   .messages {
-    max-height: 55vh;
-    min-height: 220px;
+    max-height: none;
+    min-height: 32vh;
+  }
+
+  .messages :deep(.el-scrollbar__view) {
+    padding-bottom: 84px;
+  }
+
+  .chat-card {
+    min-height: 60vh;
   }
 
   .bubble {
@@ -941,6 +998,12 @@ watch(
   .composer {
     flex-direction: column;
     align-items: stretch;
+    position: sticky;
+    bottom: 0;
+    background: #fff;
+    padding: 10px;
+    border-radius: 12px;
+    box-shadow: 0 -8px 16px rgba(75, 140, 255, 0.08); /* mobile responsive */
   }
 
   .composer :deep(.el-button) {

@@ -3,6 +3,7 @@ import { nextTick, ref, computed } from 'vue'
 import { useRouter, isNavigationFailure, NavigationFailureType } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { UploadFilled, Plus, Loading } from '@element-plus/icons-vue'
+import * as exifr from 'exifr'
 import api from '../api/http'
 
 const router = useRouter()
@@ -144,18 +145,68 @@ const formatExifDate = (value) => {
   return String(value)
 }
 
-let exifrModule = null
-const loadExifr = async () => {
-  if (exifrModule) return exifrModule
-  try {
-    const mod = await import(
-      /* @vite-ignore */ 'https://cdn.jsdelivr.net/npm/exifr@7.1.3/dist/exifr.esm.js'
-    )
-    exifrModule = mod?.default || mod
-  } catch (e) {
-    exifrModule = null
+const hasExifValue = (exif = {}) =>
+  !!(
+    exif.camera ||
+    exif.lens ||
+    exif.focalLength ||
+    exif.aperture ||
+    exif.shutter ||
+    exif.iso ||
+    exif.datetime ||
+    exif.gps
+  )
+
+const normalizeServerExif = (exif = {}) => ({
+  camera: exif.camera || '',
+  lens: exif.lens || '',
+  focalLength: exif.focalLength || (exif.focal ? formatFocal(exif.focal) : ''),
+  aperture: exif.aperture || (exif.fNumber ? formatAperture(exif.fNumber) : ''),
+  shutter: exif.shutter || (exif.exposureTime ? formatShutter(exif.exposureTime) : ''),
+  iso: exif.iso ? String(exif.iso) : '',
+  datetime: exif.datetime || '',
+  gps: exif.gps || null,
+})
+
+const applyExif = (item, exif = {}) => {
+  if (!item?.meta?.exif) return
+  const next = normalizeServerExif(exif)
+  item.meta.exif = {
+    ...item.meta.exif,
+    camera: next.camera || item.meta.exif.camera,
+    lens: next.lens || item.meta.exif.lens,
+    focalLength: next.focalLength || item.meta.exif.focalLength,
+    aperture: next.aperture || item.meta.exif.aperture,
+    shutter: next.shutter || item.meta.exif.shutter,
+    iso: next.iso || item.meta.exif.iso,
+    datetime: next.datetime || item.meta.exif.datetime,
+    gps: next.gps ?? item.meta.exif.gps ?? null,
   }
-  return exifrModule
+}
+
+const fetchExifFromServer = async (item) => {
+  if (!item?.file) return false
+  try {
+    const fd = new FormData()
+    fd.append('file', item.file)
+    const { data } = await api.post('/api/images/exif/preview', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 20000,
+    })
+    if (data?.ok === false) return false
+    applyExif(item, data?.exif || {})
+    return hasExifValue(item.meta.exif)
+  } catch (e) {
+    return false
+  }
+}
+
+const loadExifr = async () => {
+  const mod = exifr?.default || exifr
+  if (!mod) return null
+  if (typeof mod.parse === 'function') return mod
+  if (typeof mod === 'function') return { parse: mod }
+  return null
 }
 
 const buildItem = (file) => ({
@@ -207,6 +258,8 @@ const loadImageSize = (item) =>
 
 const hydrateMeta = async (item) => {
   await loadImageSize(item)
+  const serverOk = await fetchExifFromServer(item)
+  if (serverOk) return
   try {
     const exifr = await loadExifr()
     if (!exifr?.parse) return
@@ -234,7 +287,7 @@ const hydrateMeta = async (item) => {
       typeof data.GPSLatitude === 'number' && typeof data.GPSLongitude === 'number'
         ? { lat: data.GPSLatitude, lng: data.GPSLongitude }
         : null
-    item.meta.exif = {
+    applyExif(item, {
       camera,
       lens,
       focalLength: formatFocal(data.FocalLength),
@@ -243,7 +296,7 @@ const hydrateMeta = async (item) => {
       iso: data.ISO ? String(data.ISO) : '',
       datetime: formatExifDate(data.DateTimeOriginal || data.CreateDate || data.ModifyDate),
       gps,
-    }
+    })
   } catch (e) {
     // 解析失败保持默认值
   }
@@ -399,6 +452,7 @@ const analyzeItem = async (item) => {
     fd.append('file', item.file)
     const { data } = await api.post('/api/v1/images/ai-analyze', fd, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 20000,
     })
     if (data?.ok === false) {
       throw new Error(data?.error || 'AI 分析失败')
@@ -692,7 +746,7 @@ const handleStartUpload = async () => {
               </el-select>
             </el-form-item>
             <div class="meta-card">
-              <div class="meta-title">预览信息（文件/EXIF）</div>
+              <div class="meta-title">预览信息（文件）</div>
               <div class="meta-grid">
                 <div class="meta-item">
                   <span>尺寸(px)</span>
@@ -710,47 +764,6 @@ const handleStartUpload = async () => {
                   <span>创建时间</span>
                   <strong>{{ displayCreatedAt }}</strong>
                 </div>
-              </div>
-              <div class="meta-divider"></div>
-              <div class="meta-grid">
-                <div class="meta-item">
-                  <span>相机</span>
-                  <strong>{{ displayCamera }}</strong>
-                </div>
-                <div class="meta-item">
-                  <span>镜头</span>
-                  <strong>{{ displayLens }}</strong>
-                </div>
-              </div>
-              <div class="meta-divider"></div>
-              <div class="meta-grid">
-                <div class="meta-item">
-                  <span>焦距</span>
-                  <strong>{{ displayFocal }}</strong>
-                </div>
-                <div class="meta-item">
-                  <span>光圈</span>
-                  <strong>{{ displayAperture }}</strong>
-                </div>
-                <div class="meta-item">
-                  <span>快门</span>
-                  <strong>{{ displayShutter }}</strong>
-                </div>
-                <div class="meta-item">
-                  <span>ISO</span>
-                  <strong>{{ displayIso }}</strong>
-                </div>
-                <div class="meta-item">
-                  <span>拍摄时间</span>
-                  <strong>{{ displayExifTime }}</strong>
-                </div>
-              </div>
-              <div class="meta-divider"></div>
-              <div class="meta-gps">
-                <div class="meta-gps-text">{{ gpsText }}</div>
-                <el-button size="small" :disabled="!gpsAvailable" @click="toggleGps">
-                  {{ gpsButtonText }}
-                </el-button>
               </div>
             </div>
           </template>

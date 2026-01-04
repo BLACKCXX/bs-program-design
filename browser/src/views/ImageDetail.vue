@@ -46,9 +46,47 @@ const zoom = ref(100)
 const viewMode = ref('fitScreen')
 const imgLoading = ref(false)
 const showGps = ref(false)
+const isMobile = ref(false)
+const updateIsMobile = () => {
+  if (typeof window === 'undefined') return
+  isMobile.value = window.matchMedia('(max-width: 768px)').matches
+}
 const newTag = ref('')
 const tagTypes = ['success', 'warning', 'info', 'danger']
 const PREVIEW_TIMEOUT = 30000
+const gpsCoord = computed(() => { // gps map
+  const raw = image.value.exif?.gps
+  if (!raw) return null
+  if (typeof raw === 'string') {
+    const [latRaw, lngRaw] = raw.split(',').map((v) => (v || '').trim())
+    const lat = Number(latRaw)
+    const lng = Number(lngRaw)
+    if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng }
+    return null
+  }
+  if (typeof raw === 'object') {
+    const lat = Number(raw.lat ?? raw.latitude)
+    const lng = Number(raw.lng ?? raw.longitude)
+    if (Number.isFinite(lat) && Number.isFinite(lng)) return { lat, lng }
+  }
+  return null
+})
+const gpsText = computed(() => {
+  if (!gpsCoord.value) return '未提供'
+  return `${gpsCoord.value.lat.toFixed(6)}, ${gpsCoord.value.lng.toFixed(6)}`
+})
+const gpsEmbedUrl = computed(() => {
+  if (!gpsCoord.value) return ''
+  const { lat, lng } = gpsCoord.value
+  const delta = 0.01
+  const bbox = [lng - delta, lat - delta, lng + delta, lat + delta].join(',')
+  return `https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat},${lng}`
+})
+const gpsLink = computed(() => {
+  if (!gpsCoord.value) return ''
+  const { lat, lng } = gpsCoord.value
+  return `https://www.openstreetmap.org/?mlat=${lat}&mlon=${lng}#map=16/${lat}/${lng}`
+})
 
 const visibilityOptions = [
   { label: '公开', value: 'public' },
@@ -207,9 +245,13 @@ const removeTag = (tag) => {
   console.log('TODO: 调用后端删除标签', tag)
 }
 const addTag = async (tagPayload) => {
-  if (!image.value.id) return
-  const name = (tagPayload || newTag.value || '').trim()
-  if (!name) return
+  if (!image.value.id || savingTag.value) return
+  const raw = typeof tagPayload === 'string' ? tagPayload : newTag.value // add tag
+  const name = (raw || '').trim()
+  if (!name) {
+    ElMessage.warning('标签不能为空')
+    return
+  }
   if (image.value.tags.includes(name)) {
     ElMessage.info('标签已存在')
     newTag.value = ''
@@ -292,6 +334,7 @@ const stageRef = ref(null)
 const stageSize = ref({ w: 0, h: 0 })
 const imgNatural = ref({ w: 0, h: 0 })
 let stageObserver = null
+let resizeHandler = null
 
 const rotateDeg = computed(() => {
   const raw = image.value.rotate ?? image.value.rotation ?? image.value.angle ?? 0
@@ -314,7 +357,9 @@ const baseScale = computed(() => {
   const bh = bboxSize.value.h
   if (!w || !h || !bw || !bh) return 1
   if (viewMode.value === 'fitScreen') {
-    return Math.min(w / bw, h / bh) * 0.98
+    const fitW = w / bw
+    const fitH = h / bh
+    return (isMobile.value ? fitW : Math.min(fitW, fitH)) * 0.98
   }
   return w / bw
 })
@@ -393,7 +438,8 @@ const loadDetail = async () => {
   imgLoading.value = true
   previewSrc.value = ''
   imgNatural.value = { w: 0, h: 0 }
-  viewMode.value = 'fitScreen'
+  updateIsMobile()
+  viewMode.value = isMobile.value ? 'fitWidth' : 'fitScreen'
   zoom.value = 100
   isEditingMeta.value = false
 
@@ -476,10 +522,17 @@ watch(
 )
 
 onMounted(() => {
+  updateIsMobile()
+  resizeHandler = () => updateIsMobile()
+  window.addEventListener('resize', resizeHandler)
   nextTick(updateStageSize)
 })
 
 onUnmounted(() => {
+  if (resizeHandler) {
+    window.removeEventListener('resize', resizeHandler)
+    resizeHandler = null
+  }
   if (stageObserver) {
     stageObserver.disconnect()
     stageObserver = null
@@ -666,9 +719,18 @@ const goEdit = () => {
               <div v-if="showGps" class="gps-detail">
                 <div class="info-row">
                   <span class="label">坐标</span>
-                  <span class="value">{{ image.exif?.gps || '未提供' }}</span>
+                  <span class="value">{{ gpsText }}</span>
                 </div>
-                <div class="map-placeholder">TODO: 未来可以嵌入地图展示坐标</div>
+                <div v-if="gpsCoord" class="gps-map">
+                  <iframe
+                    :src="gpsEmbedUrl"
+                    title="GPS Map"
+                    loading="lazy"
+                    referrerpolicy="no-referrer-when-downgrade"
+                  ></iframe>
+                  <a class="gps-link" :href="gpsLink" target="_blank" rel="noopener">在地图打开</a>
+                </div>
+                <div v-else class="map-placeholder">未提供 GPS 坐标</div>
               </div>
             </div>
           </el-tab-pane>
@@ -981,6 +1043,26 @@ const goEdit = () => {
 }
 .gps-detail {
   margin-top: 10px;
+}
+.gps-map {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.gps-map iframe {
+  width: 100%;
+  height: 200px;
+  border: 0;
+  border-radius: 8px;
+}
+.gps-link {
+  font-size: 13px;
+  color: #1f6feb;
+  text-decoration: none;
+}
+.gps-link:hover {
+  text-decoration: underline;
 }
 .map-placeholder {
   margin-top: 6px;
@@ -1297,16 +1379,59 @@ const goEdit = () => {
 }
 
 @media (max-width: 768px) {
+  .detail-page {
+    height: auto;
+    min-height: 100vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch; /* mobile responsive */
+  }
+
+  .detail-top {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .top-left {
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .top-actions {
+    flex-shrink: 0;
+  }
+
+  .title {
+    white-space: nowrap;
+  }
+
   .detail-layout {
     flex-direction: column;
     padding: 12px 10px;
     gap: 12px;
     height: auto;
+    overflow: visible;
   }
 
   .side-column {
     max-width: none;
     min-width: 0;
+    height: auto;
+    overflow: visible;
+  }
+
+  .side-tabs {
+    height: auto;
+  }
+
+  :deep(.side-tabs .el-tabs__content) {
+    overflow: visible;
+  }
+
+  .preview-panel {
+    min-height: 45vh; /* mobile responsive */
+    height: auto;
   }
 
   .panel {
@@ -1326,13 +1451,15 @@ const goEdit = () => {
   }
 
   .preview-body {
-    min-height: 280px;
+    min-height: 45vh;
+    height: 45vh; /* mobile responsive */
     padding: 12px;
   }
 
   .img-holder,
   .img-holder img {
-    max-height: 60vh;
+    max-height: none;
+    max-width: none;
   }
 
   .editor-toolbar {
@@ -1368,6 +1495,7 @@ const goEdit = () => {
   .detail-layout {
     flex-direction: column;
     height: auto;
+    overflow: visible;
   }
   .preview-body {
     min-height: 320px;

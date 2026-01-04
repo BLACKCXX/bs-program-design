@@ -17,6 +17,12 @@ import { toDisplayUrl } from '../utils/url'
 //import api from '../api/http'
 const store = useAuthStore()
 const toAbs = (p) => toDisplayUrl(p)
+const withVersion = (url, stamp) => {
+  if (!url) return ''
+  if (!stamp) return url
+  const joiner = url.includes('?') ? '&' : '?'
+  return `${url}${joiner}v=${encodeURIComponent(stamp)}`
+}
 // —— 顶部控件 —— //
 const bulkMode = ref(false)
 const selectedIds = ref([]) // #advise 批量模式选中列表
@@ -85,7 +91,7 @@ const buildParams = () => {
   const params = { limit: 200, offset: 0 }
   const kw = (filters.keyword || '').trim()
   if (kw) params.q = kw
-  if (filters.tags.length) params.tags = filters.tags
+  if (filters.tags.length) params.tags = filters.tags.join(',') // tag filter params
   const ds = formatDate(filters.dateStart)
   const de = formatDate(filters.dateEnd)
   if (ds) params.date_start = ds
@@ -106,7 +112,7 @@ const loadImages = async () => {
       date: it.date,
       sizeMB: it.sizeMB,
       device: it.device || '',
-      cover: toAbs(it.url),
+      cover: withVersion(toAbs(it.url), it.updatedAt),
       description: it.description,
     }))
   } catch (err) {

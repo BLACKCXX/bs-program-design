@@ -44,6 +44,8 @@ ALLOWED_MIMES = {
 }
 TMP_AI_DIR = os.path.join(tempfile.gettempdir(), "bs_ai_tmp")
 os.makedirs(TMP_AI_DIR, exist_ok=True)
+TMP_EXIF_DIR = os.path.join(tempfile.gettempdir(), "bs_exif_tmp")
+os.makedirs(TMP_EXIF_DIR, exist_ok=True)
 
 
 def _facet_from_sql(field_expr: str, owner_id: int, limit: int = 50):
@@ -371,6 +373,68 @@ def _absolute_url(path: str) -> str:
         return ""
     return f"{request.host_url.rstrip('/')}{path}"
 
+def _build_exif_payload(meta: Dict) -> Dict:
+    if not meta:
+        return {}
+    make = meta.get("camera_make")
+    model = meta.get("camera_model")
+    camera = " ".join([v for v in [make, model] if v]).strip() or model or make
+    lens = meta.get("lens")
+    if not lens:
+        lens_parts = [meta.get("lens_make"), meta.get("lens_model")]
+        lens = " ".join([v for v in lens_parts if v]).strip()
+    if not lens:
+        lens = meta.get("lens_spec")
+    f_number = meta.get("f_number")
+    aperture = None
+    if f_number is not None:
+        try:
+            aperture = f"f/{float(f_number):.1f}".rstrip("0").rstrip(".")
+        except Exception:
+            aperture = f"f/{f_number}"
+    payload = {
+        "camera": camera,
+        "lens": lens,
+        "focal": meta.get("focal_length"),
+        "aperture": aperture,
+        "shutter": meta.get("exposure_time"),
+        "iso": meta.get("iso"),
+        "takenAt": meta.get("taken_at"),
+    }
+    lat = meta.get("gps_lat")
+    lng = meta.get("gps_lng")
+    payload["gps"] = {"lat": lat, "lng": lng} if lat is not None and lng is not None else None
+    return payload
+
+def _format_exif_preview(payload: Dict) -> Dict:
+    if not payload:
+        return {}
+    focal = payload.get("focal")
+    if focal is not None and focal != "":
+        try:
+            focal_text = f"{float(focal):.0f}mm"
+        except Exception:
+            focal_text = str(focal)
+    else:
+        focal_text = ""
+    taken_at = payload.get("takenAt")
+    if isinstance(taken_at, datetime):
+        dt_text = taken_at.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        dt_text = str(taken_at) if taken_at else ""
+    iso_val = payload.get("iso")
+    iso_text = str(iso_val) if iso_val is not None else ""
+    return {
+        "camera": payload.get("camera") or "",
+        "lens": payload.get("lens") or "",
+        "focalLength": focal_text,
+        "aperture": payload.get("aperture") or "",
+        "shutter": payload.get("shutter") or "",
+        "iso": iso_text,
+        "datetime": dt_text,
+        "gps": payload.get("gps"),
+    }
+
 
 @bp.get("/api/images/facets")
 @jwt_required()
@@ -421,6 +485,35 @@ def image_facets():
 
 
 # ===== AI 智能分析 =====
+@bp.post("/api/images/exif/preview")
+@jwt_required()
+def exif_preview():
+    """Preview EXIF data for a local file without saving to DB."""
+    g.user_id = _current_user_id_from_jwt()
+    fs = request.files.get("file")
+    if not fs:
+        return jsonify({"ok": False, "error": "è¯·ä¸Šä¼ å›¾ç‰‡æ–‡ä»¶"}), 400
+    ext = (fs.filename.rsplit(".", 1)[-1] or "").lower() if fs.filename else ""
+    mime = (fs.mimetype or "").lower()
+    if ext not in ALLOWED_EXTS or mime not in ALLOWED_MIMES:
+        return jsonify({"ok": False, "error": "ä»…æ”¯æŒå¸¸è§å›¾ç‰‡æ ¼å¼"}), 400
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix="exif_", suffix=f".{ext or 'jpg'}", dir=TMP_EXIF_DIR)
+        os.close(fd)
+        fs.save(temp_path)
+        meta = extract_exif(temp_path)
+        payload = _build_exif_payload(meta)
+        return jsonify({"ok": True, "exif": _format_exif_preview(payload)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": "EXIF åˆ†æžå¤±è´¥", "detail": str(exc)}), 500
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
 @bp.post("/api/v1/images/ai-analyze")
 @jwt_required()
 def ai_analyze_image():
@@ -789,6 +882,8 @@ def search_images():
     max_size_kb = (args.get("max_size_kb") or "").strip()
 
     tag_params = args.getlist("tags") or []
+    if not tag_params:
+        tag_params = args.getlist("tags[]") or []  # tag filter params
     if not tag_params and args.get("tags"):
         tag_params = [p.strip() for p in (args.get("tags") or "").split(",") if p.strip()]
     tag_params = [t for t in tag_params if t]
@@ -925,7 +1020,7 @@ def search_images():
           i.id, i.title, i.description, i.stored_path, i.path,
           COALESCE(i.size_bytes, i.size) AS size_bytes,
           {ts_expr} AS sort_time,
-          i.taken_at, i.created_at,
+          i.taken_at, i.created_at, i.updated_at,
           COALESCE(e.camera_make, i.camera_make) AS camera_make,
           COALESCE(e.camera_model, i.camera_model) AS camera_model,
           e.iso, e.focal_length,
@@ -965,6 +1060,7 @@ def search_images():
         taken = date_val.strftime("%Y-%m-%d") if date_val else None
         size_mb = round((r.get("size_bytes") or 0) / 1024 / 1024, 2)
         device = classify_device(r.get("camera_make"), r.get("camera_model"))
+        updated_at = r.get("updated_at") or r.get("created_at")
         return {
             "id": r["id"],
             "title": r.get("title") or "未命名",
@@ -974,6 +1070,7 @@ def search_images():
             "sizeMB": size_mb,
             "url": f"/files/{rel_path}" if rel_path else "",
             "device": device,
+            "updatedAt": updated_at.strftime("%Y-%m-%d %H:%M:%S") if updated_at else None,
         }
 
     items = [fmt_row(r) for r in rows]
@@ -1211,7 +1308,8 @@ def image_detail(image_id: int):
                i.width, i.height, i.created_at, i.updated_at, i.taken_at
                {visibility_sql},
                e.camera_make, e.camera_model, e.f_number, e.exposure_time,
-               e.iso, e.focal_length, e.gps_lat, e.gps_lng, e.taken_at AS exif_taken_at
+               e.iso, e.focal_length, e.gps_lat, e.gps_lng, e.taken_at AS exif_taken_at,
+               e.extra AS exif_extra
         FROM images i
         LEFT JOIN exif e ON e.image_id = i.id
         WHERE i.id=%s AND i.owner_id=%s
@@ -1238,9 +1336,22 @@ def image_detail(image_id: int):
     url = f"/files/{rel_path}" if rel_path else ""
     abs_url = _absolute_url(url)
 
+    camera_make = img.get("camera_make")
+    camera_model = img.get("camera_model")
+    camera = " ".join([v for v in [camera_make, camera_model] if v]).strip() or camera_model or camera_make
+    lens = None
+    exif_extra = img.get("exif_extra")
+    if isinstance(exif_extra, str):
+        try:
+            exif_extra = json.loads(exif_extra)
+        except Exception:
+            exif_extra = None
+    if isinstance(exif_extra, dict):
+        lens = exif_extra.get("lens") or exif_extra.get("LensModel") or exif_extra.get("LensMake")
+
     exif = {
-        "camera": img.get("camera_model") or img.get("camera_make"),
-        "lens": None,  # 未单独存镜头信息
+        "camera": camera,
+        "lens": lens,
         "focal": img.get("focal_length"),
         "aperture": f"f/{img['f_number']}" if img.get("f_number") else None,
         "shutter": img.get("exposure_time"),
@@ -1250,6 +1361,41 @@ def image_detail(image_id: int):
         if img.get("gps_lat") is not None and img.get("gps_lng") is not None
         else None,
     }
+
+    needs_fallback = not (
+        exif.get("camera")
+        and exif.get("lens")
+        and exif.get("focal")
+        and exif.get("aperture")
+        and exif.get("shutter")
+        and exif.get("iso")
+        and exif.get("takenAt")
+    )
+    needs_gps = not exif.get("gps")
+    if (needs_fallback or needs_gps) and rel_path:
+        abs_root = os.path.abspath(current_app.config["UPLOAD_DIR"])
+        abs_path = os.path.join(abs_root, rel_path)
+        if os.path.exists(abs_path):
+            fallback_payload = None
+            try:
+                fallback_meta = extract_exif(abs_path)
+                fallback_payload = _build_exif_payload(fallback_meta)
+            except Exception:
+                fallback_payload = None
+            if fallback_payload:
+                exif["camera"] = exif.get("camera") or fallback_payload.get("camera")
+                exif["lens"] = exif.get("lens") or fallback_payload.get("lens")
+                exif["focal"] = exif.get("focal") or fallback_payload.get("focal")
+                exif["aperture"] = exif.get("aperture") or fallback_payload.get("aperture")
+                exif["shutter"] = exif.get("shutter") or fallback_payload.get("shutter")
+                exif["iso"] = exif.get("iso") or fallback_payload.get("iso")
+                exif["takenAt"] = exif.get("takenAt") or fallback_payload.get("takenAt")
+                if needs_gps and fallback_payload.get("gps"):
+                    gps_payload = fallback_payload.get("gps")
+                    if isinstance(gps_payload, dict):
+                        exif["gps"] = f"{gps_payload.get('lat')},{gps_payload.get('lng')}"
+                    else:
+                        exif["gps"] = gps_payload
 
     # 派生关系：返回 parent 和 children 列表
     parent = None

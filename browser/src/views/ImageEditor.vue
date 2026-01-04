@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, watch, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, ZoomOut, ZoomIn, FullScreen, RefreshLeft, RefreshRight } from '@element-plus/icons-vue'
@@ -29,6 +29,12 @@ const previewRequestSeq = ref(0)
 const PREVIEW_TIMEOUT = 120000
 const PREVIEW_DEBOUNCE = 180
 let previewDebounceTimer = null
+const isMobile = ref(false)
+const updateIsMobile = () => {
+  if (typeof window === 'undefined') return
+  isMobile.value = window.matchMedia('(max-width: 768px)').matches
+}
+let resizeHandler = null
 
 const buildDefaultParams = () => ({
   deg: 0,
@@ -316,6 +322,7 @@ const loadDetail = async () => {
   previewUrl.value = ''
   endScaleDrag()
   previewLoading.value = false
+  updateIsMobile()
 
   let data = null
   try {
@@ -390,7 +397,9 @@ const fitScale = computed(() => {
   const bw = bboxSize.value.w
   const bh = bboxSize.value.h
   if (!w || !h || !bw || !bh) return 1
-  return Math.min(w / bw, h / bh) * 0.98
+  const fitW = w / bw
+  const fitH = h / bh
+  return (isMobile.value ? fitW : Math.min(fitW, fitH)) * 0.98
 })
 const renderScale = computed(() => fitScale.value * (zoom.value / 100))
 const scaleRatioX = computed(() => {
@@ -490,8 +499,18 @@ watch(
   }
 )
 
+onMounted(() => {
+  updateIsMobile()
+  resizeHandler = () => updateIsMobile()
+  window.addEventListener('resize', resizeHandler)
+})
+
 onUnmounted(() => {
   endScaleDrag()
+  if (resizeHandler) {
+    window.removeEventListener('resize', resizeHandler)
+    resizeHandler = null
+  }
   if (stageObserver) {
     stageObserver.disconnect()
     stageObserver = null
@@ -829,6 +848,7 @@ const endDrag = () => {
 
 const exportMode = ref('override')
 const exportName = ref('')
+const skipLeaveConfirm = ref(false)
 const onExport = async () => {
   if (exportMode.value === 'new' && !exportName.value.trim()) {
     ElMessage.warning('请先输入导出名称')
@@ -860,8 +880,11 @@ const onExport = async () => {
     const nextId = data?.image_id || imageId
     const stamp = data?.updatedAt ? new Date(data.updatedAt).getTime() || Date.now() : Date.now()
     ElMessage.success('导出成功')
-    router.push({ name: 'ImageDetail', params: { id: nextId }, query: buildDetailQuery(stamp) })
+    skipLeaveConfirm.value = true
+    resetHistory()
+    await router.push({ name: 'ImageDetail', params: { id: nextId }, query: buildDetailQuery(stamp) })
   } catch (err) {
+    skipLeaveConfirm.value = false
     ElMessage.error(err?.response?.data?.error || '导出失败')
   }
 }
@@ -890,6 +913,7 @@ const promptCommitMode = async () => {
 }
 
 const confirmLeave = async () => {
+  if (skipLeaveConfirm.value) return true
   if (isCropping.value || isScaling.value) {
     ElMessage.warning('请先应用或取消当前操作')
     return false
@@ -1373,6 +1397,29 @@ onBeforeRouteLeave(async () => {
   }
   .editor-right {
     height: auto;
+  }
+}
+
+@media (max-width: 768px) {
+  .editor-page {
+    height: auto;
+    min-height: 100vh;
+    overflow-y: auto;
+  }
+
+  .editor-top {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .editor-top .title {
+    white-space: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .stage-body {
+    height: clamp(240px, 50vh, 560px);
   }
 }
 </style>

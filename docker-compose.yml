@@ -16,13 +16,44 @@ services:
     volumes:
       - dbdata:/var/lib/mysql
       - ./database/schema.sql:/docker-entrypoint-initdb.d/10_schema.sql:ro
-      - ./server:/app
-      - uploads_data:/app/uploads 
     healthcheck:
       test: ["CMD","mysqladmin","ping","-h","localhost","-prootpass"]
       interval: 5s
       timeout: 3s
       retries: 40
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    env_file:
+      - ./.env
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: bs_user
+      DB_PASSWORD: bs_pass_123
+      DB_NAME: bs_db
+      JWT_SECRET_KEY: dev-change-me
+      UPLOAD_DIR: uploads
+      MAX_UPLOAD_MB: 10
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads_data:/app/server/uploads
+
+  web:
+    build:
+      context: .
+      dockerfile: browser/Dockerfile
+    depends_on:
+      - server
+    ports:
+      - "8080:80"
+
 volumes:
   uploads_data:
   dbdata:
